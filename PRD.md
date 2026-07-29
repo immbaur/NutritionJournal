@@ -15,13 +15,13 @@ one or more **photos**, an **audio** note, **text**, or any mix of the three —
 a background AI agent analyzes the inputs to estimate nutrition facts (calories,
 protein, fat, carbs, and more) as accurately as the provided evidence allows.
 The user reviews the estimate, confirms it, and the entry is saved as its **own
-JSON file** with a timestamp, date, location, and an auto-classified meal type. A
-human-readable CSV of the full history can be exported/derived from those JSON
-files on demand.
+folder** (a `meal.json` plus the original photos/audio/text) with a timestamp,
+date, location, and an auto-classified meal type. A human-readable CSV of the full
+history can be exported/derived from those meal files on demand.
 
-Storing each meal as a separate JSON file (rather than appending to one shared
-file) means a bad or interrupted write can only ever affect that single meal —
-never the whole history.
+Storing each meal in its own folder (rather than appending to one shared file)
+means a bad or interrupted write can only ever affect that single meal — never the
+whole history.
 
 The app opens on a **daily dashboard**: today's running nutrition totals so far
 plus the day's meals, with easy navigation back through yesterday, the day
@@ -108,8 +108,10 @@ work of turning messy multi-modal input into structured numbers.
     brand names, quantities).
 - **FR-2** Any combination is valid, including a single modality alone. Submitting
   with **zero** inputs is blocked with a clear message.
-- **FR-3** On submit, inputs are uploaded/stored to a per-entry working area for
-  the agent to read.
+- **FR-3** On submit, inputs are uploaded to an **isolated per-entry staging
+  workspace** (e.g. `data/agent-workspace/<staging_id>/`), separate from the
+  persistent meal store, for the agent to read. This is temporary scratch space,
+  not the datastore (see 5.4.1 for its lifecycle).
 
 ### 5.2 Agent analysis
 
@@ -147,7 +149,10 @@ work of turning messy multi-modal input into structured numbers.
   + totals + assumptions).
 - **FR-9** The user can **edit** any value (correct a number, add/remove an item)
   and can **re-run** the agent or **cancel** entirely.
-- **FR-10** Nothing is written to the datastore until the user **confirms**.
+- **FR-10** Nothing is written to the **persistent meal store**
+  (`data/meals/`) until the user **confirms**. Uploaded inputs and the agent's
+  analysis result do exist temporarily beforehand, but only in the **isolated
+  staging workspace** (FR-3, 5.4.1) — never in the datastore.
 
 #### 5.3.1 Confidence & refinement loop
 
@@ -164,8 +169,8 @@ work of turning messy multi-modal input into structured numbers.
 
 ### 5.4 Save
 
-- **FR-11** On confirm, the app writes **one JSON file for this meal** (e.g.
-  `data/meals/<entry_id>.json`) capturing:
+- **FR-11** On confirm, the app writes **this meal's folder**
+  (`data/meals/<entry_id>/`, with `meal.json` inside — see §6.1) capturing:
   - Auto-generated `entry_id`
   - `timestamp` (local time) and `date`
   - `location` (see 5.6)
@@ -180,12 +185,34 @@ work of turning messy multi-modal input into structured numbers.
 - **FR-12** The **agent never writes to the persistent store directly.** It only
   produces a proposed estimate in an **isolated per-entry staging file** (in the
   agent workspace). On confirm, the **server** validates that proposal (plus any
-  user edits) and writes the final `data/meals/<entry_id>.json` atomically
-  (write-temp-then-rename). Because each meal is its own file, a malformed or
-  interrupted write can only affect that one entry — the rest of the history is
-  never touched.
+  user edits) and writes the final `data/meals/<entry_id>/meal.json` atomically
+  (write-temp-then-rename within the meal folder). Because each meal is its own
+  folder, a malformed or interrupted write can only affect that one entry — the
+  rest of the history is never touched.
 - **FR-12a** There is **no single shared data file to corrupt.** The CSV is not a
   stored source of truth; it is generated on demand from the JSON files (see §6).
+
+#### 5.4.1 Staging workspace lifecycle & cleanup
+
+The staging workspace (`data/agent-workspace/`) holds temporary per-entry
+directories created at submit time (FR-3), each containing the uploaded
+photos/audio/text and the agent's proposed result. It must not accumulate
+abandoned files. Rules:
+
+- **FR-12b (Confirm → promote)** On confirm, the entry's inputs are **moved (or
+  copied then deleted)** from its staging directory into the permanent
+  `data/meals/<entry_id>/` folder, and the staging directory is removed. The
+  persistent folder is a self-contained record; nothing it needs is left behind in
+  staging.
+- **FR-12c (Cancel → delete)** If the user cancels/discards the entry, its staging
+  directory (uploads and any proposed result) is **deleted immediately**.
+- **FR-12d (Abandoned → expire)** Staging directories that are never confirmed or
+  cancelled — e.g. the tab was closed, the analysis timed out — are **deleted
+  after a retention period** (configurable, default ~24 h). A sweep runs on server
+  start and periodically thereafter, removing any staging directory older than the
+  retention window.
+- **FR-12e** Cleanup only ever touches `data/agent-workspace/`; it must **never**
+  delete anything under `data/meals/`.
 
 ### 5.5 Meal-type auto-classification
 
@@ -237,9 +264,9 @@ work of turning messy multi-modal input into structured numbers.
   where the user can edit or delete it (FR-16a).
 - **FR-16a** **Post-save editing:** the user can edit or delete a previously saved
   entry (correct any nutrient value, meal type, location name, or note; remove the
-  entry entirely). An edit **rewrites only that entry's JSON file** atomically; a
-  delete removes (or tombstones) that single file. No other entry is affected, and
-  totals recompute automatically.
+  entry entirely). An edit **rewrites only that entry's `meal.json`** atomically;
+  a delete removes (or tombstones) that single meal folder. No other entry is
+  affected, and totals recompute automatically.
 - **FR-16b** **CSV export:** the user can export the full history to CSV
   on demand (a button/endpoint), and/or a small script (`export-csv`) regenerates
   `data/intake-history.csv` from all JSON files. The CSV is always a **derived
@@ -255,15 +282,28 @@ work of turning messy multi-modal input into structured numbers.
 
 ## 6. Data Model
 
-### 6.1 Source of truth: one JSON file per meal
+### 6.1 Source of truth: one folder per meal
 
-Each confirmed meal is stored as its own JSON file, e.g.
-`data/meals/<entry_id>.json` (the filename sortable by time, e.g.
-`2026-07-29T12-30-05__<shortid>.json`). This is the **only source of truth**.
-There is deliberately **no single shared data file** — so no write can corrupt the
-whole history; the blast radius of any bad write is one meal.
+Each confirmed meal gets its **own folder**, `data/meals/<entry_id>/`, containing
+the structured entry plus its raw inputs. The `<entry_id>` is sortable by time
+(e.g. `2026-07-29T12-30-05__a1b2c3`), so listing `data/meals/` is chronological.
 
-Proposed per-meal schema:
+```
+data/meals/<entry_id>/
+  meal.json        # the structured entry — the source of truth
+  note.txt         # verbatim text input (present only if text was given)
+  photo-1.jpg      # uploaded photo(s), original files
+  photo-2.jpg
+  audio.webm       # uploaded/recorded audio (present only if given)
+```
+
+- **`meal.json`** is the single source of truth for that entry (schema below).
+- **`media_refs`** in `meal.json` lists filenames **relative to the meal folder**
+  (`photo-1.jpg`, `audio.webm`, `note.txt`), never absolute paths.
+- There is deliberately **no single shared data file** — so no write can corrupt
+  the whole history; the blast radius of any bad write is one meal's folder.
+
+Proposed `meal.json` schema:
 
 ```json
 {
@@ -309,21 +349,22 @@ Field notes:
 
 ### 6.2 Raw inputs are preserved for every entry
 
-All three modalities the user supplied are kept alongside the JSON, not just the
-derived numbers — under a per-entry folder (e.g. `data/meals/<entry_id>/` or
-`data/media/<entry_id>/`):
+All three modalities the user supplied are kept **inside the same meal folder**
+(§6.1), not just the derived numbers:
 - **Photos & audio** → the uploaded files, referenced by `media_refs`.
-- **Text** → stored verbatim in the JSON `note` field **and** as `note.txt` in the
-  entry folder, so the folder is a complete record of what was submitted.
+- **Text** → stored verbatim in `meal.json`'s `note` field **and** as `note.txt`,
+  so the folder is a complete record of what was submitted.
 
-This means an entry can always be **re-analyzed later from its original inputs**.
-Transient per-entry inputs also live in an agent workspace dir during analysis,
-mirroring Momentum's `data/agent-workspace/`.
+This means an entry can always be **re-analyzed later from its original inputs**,
+and the whole meal (data + media) can be backed up, moved, or deleted as one
+directory. Transient inputs during analysis live in a separate agent workspace
+dir, mirroring Momentum's `data/agent-workspace/`; only on confirm is the final
+folder written under `data/meals/`.
 
 ### 6.3 CSV is a derived export (not a stored source of truth)
 
 A flat, human-readable CSV (`data/intake-history.csv`) is produced **on demand**
-by flattening all meal JSON files — one row per entry, one column per nutrient
+by flattening every `data/meals/<entry_id>/meal.json` — one row per entry, one column per nutrient
 `value` plus optional `_low`/`_high` columns, and the scalar fields (`entry_id`,
 `timestamp`, `date`, `meal_type`, `items`, `note`, `lat`, `long`,
 `location_name`, `media_refs`, `confidence`, `confidence_note`, `model_used`).
@@ -350,9 +391,10 @@ its loss is harmless — the JSON files remain authoritative.
   pay-per-token API. No API key / metered usage. Opus is vision-capable, which is
   required since photos (food + nutrition labels) are core to the analysis.
 - **Uploads:** multipart handling for images/audio (multiple files per request).
-- **Datastore:** **one JSON file per meal** under `data/meals/` (source of truth),
+- **Datastore:** **one folder per meal** under `data/meals/<entry_id>/`, whose
+  `meal.json` is the source of truth (raw media/`note.txt` live beside it),
   written atomically (temp-file + rename) by the server only. CSV is a derived
-  export regenerated from the JSON files on demand. JSON files also hold
+  export regenerated from the meal folders on demand. Separate JSON files hold
   auth/sessions/transient state, as in Momentum.
 - **Auth:** password + session cookies, as in Momentum.
 - **Deployment:** local run script + Cloudflare quick tunnel for session use;
@@ -376,8 +418,9 @@ its loss is harmless — the JSON files remain authoritative.
    assumptions.
 6. App shows the **estimated breakdown**.
 7. User reviews, optionally edits or re-runs, then taps **Confirm**.
-8. Server writes the meal's **own JSON file** (`data/meals/<entry_id>.json`) with
-   timestamp, date, location, auto meal-type, and the confirmed values.
+8. Server writes the meal's **own folder** (`data/meals/<entry_id>/` with
+   `meal.json` + the raw inputs) with timestamp, date, location, auto meal-type,
+   and the confirmed values.
 9. App returns to the **Today dashboard** with the new meal listed and today's
    running totals updated (read live from the JSON files); CSV can be exported any
    time.
@@ -402,11 +445,12 @@ its loss is harmless — the JSON files remain authoritative.
    detail/photos and re-run. (Ref. FR-9a/9b)
 7. **Provenance:** each entry records the **`model_used`** that produced its
    estimate. (Ref. §6)
-8. **Storage architecture:** **one JSON file per meal** is the source of truth
-   (corruption-resistant — one bad write ≠ whole history). The **agent never
-   writes the persistent store**; it writes an isolated staging file and the
-   server writes the final per-meal JSON on confirm. **CSV is a derived export**
-   regenerated from the JSON files on demand. (Ref. §6, FR-11/12, FR-16b)
+8. **Storage architecture:** **one folder per meal** (`data/meals/<entry_id>/`
+   with `meal.json` + raw inputs) is the source of truth (corruption-resistant —
+   one bad write ≠ whole history). The **agent never writes the persistent
+   store**; it writes an isolated staging file and the server writes the final
+   `meal.json` on confirm. **CSV is a derived export** regenerated from the meal
+   folders on demand. (Ref. §6, FR-11/12, FR-16b)
 
 ### Remaining to confirm during build
 - Audio accepted formats and in-browser recording approach.
@@ -420,8 +464,8 @@ its loss is harmless — the JSON files remain authoritative.
 
 - Logging a typical meal (photo + a few words) takes **well under a minute** end
   to end.
-- Each meal is a **self-contained JSON file**; a corrupt or interrupted write can
-  never damage more than that one entry.
+- Each meal is a **self-contained folder** (`meal.json` + its raw inputs); a
+  corrupt or interrupted write can never damage more than that one entry.
 - The exported CSV is **openable in any spreadsheet app** and immediately
   understandable, and can be regenerated from the JSON files at any time.
 - When explicit grams/labels are provided, the saved numbers **match the facts**
