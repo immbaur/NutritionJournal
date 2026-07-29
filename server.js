@@ -85,6 +85,16 @@ const CANONICAL_UNITS = ['g', 'ml'];
 const AMOUNT_UNITS = ['g', 'ml', 'serving', 'package'];
 const PANTRY_SOURCES = ['label-photo', 'user-stated'];
 const PANTRY_ADDED_VIA = ['manual', 'meal-auto'];
+// The four macros that must not all be zero. A label whose serving is small
+// enough (1 tsp of mustard, a spray of oil) rounds every macro to 0, and
+// scaling that to a per-100 basis stores a food with no calories at any
+// quantity. Faithful to the label, wrong about the food — so flag it rather
+// than let the zero pass as a fact.
+const MACRO_KEYS = ['calories', 'protein_g', 'fat_g', 'carbs_g'];
+const ROUNDING_FLOOR_CONFIDENCE = 0.25;
+const ROUNDING_FLOOR_NOTE =
+  'Label rounds every macro to zero at its serving size, so the per-100 values '
+  + 'are a rounding floor, not the real density — check before relying on it.';
 // Where an item's numbers in a meal came from (FR-5, items[].origin).
 const ITEM_ORIGINS = ['pantry', 'label', 'user-stated', 'estimate'];
 
@@ -485,6 +495,13 @@ function cleanAliases(input) {
   return out;
 }
 
+// True when every macro is zero — physically impossible for a real food, so it
+// always means the label rounded them away at its serving size (see MACRO_KEYS).
+// Fiber is ignored: it is legitimately null/0 on plenty of labels.
+function isRoundingFloor(nutrition) {
+  return MACRO_KEYS.every((k) => nutrition[k] && nutrition[k].value === 0);
+}
+
 // Validates the editable content of a pantry item (agent proposal or client
 // edit) into a whitelisted copy — server owns item_id, timestamps, media_refs,
 // added_via, etc. Returns { content } or { error }.
@@ -509,6 +526,23 @@ function validateAndCleanPantryItem(input) {
   let source = typeof input.source === 'string' ? input.source.trim().toLowerCase() : '';
   if (!PANTRY_SOURCES.includes(source)) source = 'label-photo';
 
+  // An all-zero-macro item can never be trusted as a density, so it is capped to
+  // a low confidence and carries the reason — whatever the agent or client said.
+  const roundingFloor = isRoundingFloor(nutrition);
+  let confidence = cleanConfidence(input.confidence);
+  let confidenceNote = cleanLine(input.confidence_note, LIMITS.confidenceNote);
+  if (roundingFloor) {
+    confidence = confidence == null
+      ? ROUNDING_FLOOR_CONFIDENCE
+      : Math.min(confidence, ROUNDING_FLOOR_CONFIDENCE);
+    confidenceNote = cleanLine(
+      confidenceNote && !confidenceNote.includes('rounding floor')
+        ? `${ROUNDING_FLOOR_NOTE} (${confidenceNote})`
+        : ROUNDING_FLOOR_NOTE,
+      LIMITS.confidenceNote
+    );
+  }
+
   return {
     content: {
       name,
@@ -519,8 +553,9 @@ function validateAndCleanPantryItem(input) {
       serving_size: cleanAmountUnit(input.serving_size, CANONICAL_UNITS, basis.unit),
       package_size: cleanAmountUnit(input.package_size, CANONICAL_UNITS, basis.unit),
       source,
-      confidence: cleanConfidence(input.confidence),
-      confidence_note: cleanLine(input.confidence_note, LIMITS.confidenceNote),
+      rounding_floor: roundingFloor,
+      confidence,
+      confidence_note: confidenceNote,
       model_used: cleanLine(input.model_used, LIMITS.modelUsed) || AGENT_MODEL
     }
   };
@@ -682,6 +717,7 @@ function createPantryItem(content, opts = {}) {
     serving_size: content.serving_size,
     package_size: content.package_size,
     source: content.source,
+    rounding_floor: content.rounding_floor,
     added_via: PANTRY_ADDED_VIA.includes(opts.addedVia) ? opts.addedVia : 'manual',
     added_from_entry_id: opts.addedFromEntryId || null,
     confidence: content.confidence,
@@ -721,6 +757,7 @@ function updatePantryItem(itemId, content, opts = {}) {
     serving_size: content.serving_size,
     package_size: content.package_size,
     source: content.source,
+    rounding_floor: content.rounding_floor,
     confidence: content.confidence,
     confidence_note: content.confidence_note,
     model_used: content.model_used,
@@ -732,6 +769,20 @@ function updatePantryItem(itemId, content, opts = {}) {
   return updated;
 }
 
+// Fills a client-submitted item's provenance fields from the staged proposal it
+// came from, matched by the index the review UI rendered it at. Only fills what
+// the payload omitted, so a deliberate user override still wins.
+function withStagedProvenance(raw, proposals) {
+  const idx = Number(raw && raw.proposal_index);
+  const staged = Number.isInteger(idx) && idx >= 0 ? proposals[idx] : null;
+  if (!staged) return raw;
+  const merged = { ...raw };
+  if (merged.confidence == null || merged.confidence === '') merged.confidence = staged.confidence;
+  if (!merged.confidence_note) merged.confidence_note = staged.confidence_note;
+  if (!merged.model_used) merged.model_used = staged.model_used;
+  return merged;
+}
+
 // Persists the accepted pantry items from a review step: updates when the client
 // (or the agent's match) points at an existing id, otherwise creates. Shared by
 // the meal on-the-fly path and the deliberate New Item flow. Returns a short
@@ -739,8 +790,12 @@ function updatePantryItem(itemId, content, opts = {}) {
 function savePantryItems(accepted, opts = {}) {
   const saved = [];
   if (!Array.isArray(accepted)) return saved;
+  const proposals = Array.isArray(opts.proposals) ? opts.proposals : [];
   for (const raw of accepted) {
-    const { content } = validateAndCleanPantryItem(raw);
+    // The review form only round-trips the editable fields, so confidence and
+    // model_used would be lost on confirm. Recover them from the agent's staged
+    // proposal (FR-26) — the server owns provenance, not the client payload.
+    const { content } = validateAndCleanPantryItem(withStagedProvenance(raw, proposals));
     if (!content) continue;
     const mediaRefs = (Array.isArray(raw.media_refs) ? raw.media_refs : [])
       .filter((n) => typeof n === 'string' && MEDIA_NAME_RE.test(n));
@@ -1491,7 +1546,8 @@ app.post('/api/intake/:id/confirm', (req, res) => {
     pantryAdded = savePantryItems((req.body || {}).pantry_items, {
       addedVia: 'meal-auto',
       addedFromEntryId: entryId,
-      srcDir: mealDir
+      srcDir: mealDir,
+      proposals: (readStagingStatus(stagingId) || {}).proposed_pantry_items
     });
   } catch (err) { /* meal is saved; a pantry write failure must not lose it */ }
 
@@ -1650,8 +1706,10 @@ function summarisePantryItem(item) {
     serving_size: item.serving_size || null,
     package_size: item.package_size || null,
     source: item.source || '',
+    rounding_floor: !!item.rounding_floor,
     added_via: item.added_via || '',
     confidence: item.confidence != null ? item.confidence : null,
+    confidence_note: item.confidence_note || '',
     last_verified: item.last_verified || '',
     last_used_at: item.last_used_at || null,
     media_refs: item.media_refs || []
@@ -1686,7 +1744,13 @@ app.get('/api/pantry/:id', (req, res) => {
 app.put('/api/pantry/:id', (req, res) => {
   const id = req.params.id;
   if (!ITEM_ID_RE.test(id)) return res.status(400).json({ error: 'Invalid id.' });
-  const { content, error } = validateAndCleanPantryItem(req.body);
+  // The edit form posts only the editable fields, so fall back to what the item
+  // already carries — correcting an alias must not erase its provenance.
+  const existing = readJson(path.join(PANTRY_DIR, id, 'item.json')) || {};
+  const { content, error } = validateAndCleanPantryItem(withStagedProvenance(
+    { ...req.body, proposal_index: 0 },
+    [existing]
+  ));
   if (error) return res.status(400).json({ error });
   const updated = updatePantryItem(id, content);
   if (!updated) return res.status(404).json({ error: 'Item not found.' });
@@ -1762,7 +1826,11 @@ app.post('/api/pantry/intake/:id/confirm', (req, res) => {
   }
   let saved;
   try {
-    saved = savePantryItems(items, { addedVia: 'manual', srcDir: dir });
+    saved = savePantryItems(items, {
+      addedVia: 'manual',
+      srcDir: dir,
+      proposals: (readStagingStatus(stagingId) || {}).items
+    });
   } catch (err) {
     return res.status(500).json({ error: `Could not save the item(s): ${err.message}` });
   }
@@ -1812,6 +1880,8 @@ module.exports = {
   cleanPantryNutrient,
   cleanAliases,
   validateAndCleanPantryItem,
+  isRoundingFloor,
+  withStagedProvenance,
   listPantry,
   buildPantryIndex,
   findMatchingPantryItem,

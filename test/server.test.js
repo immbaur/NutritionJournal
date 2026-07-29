@@ -28,6 +28,8 @@ const {
   cleanPantryNutrient,
   cleanAliases,
   validateAndCleanPantryItem,
+  isRoundingFloor,
+  withStagedProvenance,
   buildPantryIndex,
   findMatchingPantryItem,
   resolvePantryContribution,
@@ -391,6 +393,98 @@ test('validateAndCleanPantryItem requires a name, basis, and macro values', () =
 test('validateAndCleanPantryItem falls back to label-photo for an unknown source', () => {
   const input = samplePantryInput(); input.source = 'made-up';
   assert.equal(validateAndCleanPantryItem(input).content.source, 'label-photo');
+});
+
+test('validateAndCleanPantryItem keeps the confidence it was given', () => {
+  const { content } = validateAndCleanPantryItem(samplePantryInput());
+  assert.equal(content.confidence, 0.95);
+  assert.equal(content.rounding_floor, false);
+});
+
+// --- Pantry: rounding floor (all-zero macros) ------------------------------
+
+function zeroMacroInput() {
+  const input = samplePantryInput();
+  input.name = 'organic yellow mustard';
+  input.basis = { amount: 100, unit: 'g' };
+  input.nutrition = {
+    calories: { value: 0 }, protein_g: { value: 0 },
+    fat_g: { value: 0 }, carbs_g: { value: 0 }, fiber_g: { value: null }
+  };
+  input.serving_size = { amount: 5, unit: 'g' };
+  return input;
+}
+
+test('isRoundingFloor spots all-zero macros and ignores fiber', () => {
+  assert.equal(isRoundingFloor(zeroMacroInput().nutrition), true);
+  assert.equal(isRoundingFloor(samplePantryInput().nutrition), false);
+  // A zero-carb food is not a rounding floor — only all four together.
+  const gruyere = {
+    calories: { value: 393 }, protein_g: { value: 28.6 },
+    fat_g: { value: 32.1 }, carbs_g: { value: 0 }, fiber_g: { value: 0 }
+  };
+  assert.equal(isRoundingFloor(gruyere), false);
+});
+
+test('an all-zero-macro item is flagged and capped to low confidence', () => {
+  const { content } = validateAndCleanPantryItem(zeroMacroInput());
+  assert.equal(content.rounding_floor, true);
+  assert.ok(content.confidence <= 0.25, `expected a capped confidence, got ${content.confidence}`);
+  assert.match(content.confidence_note, /rounding floor/);
+});
+
+test('the rounding-floor cap cannot be overridden by a high confidence claim', () => {
+  const input = zeroMacroInput();
+  input.confidence = 1;
+  input.confidence_note = 'read every value off the label';
+  const { content } = validateAndCleanPantryItem(input);
+  assert.ok(content.confidence <= 0.25);
+  // The original note is preserved alongside the warning, not discarded.
+  assert.match(content.confidence_note, /read every value off the label/);
+});
+
+test('a missing confidence on a normal item stays null rather than inventing one', () => {
+  const input = samplePantryInput();
+  delete input.confidence;
+  const { content } = validateAndCleanPantryItem(input);
+  assert.equal(content.confidence, null);
+  assert.equal(content.rounding_floor, false);
+});
+
+// --- Pantry: provenance survives the review round-trip ---------------------
+
+test('withStagedProvenance restores confidence the review form dropped', () => {
+  const staged = [{ confidence: 0.93, confidence_note: 'clean carton label', model_used: 'opus' }];
+  // What the client posts back: edited values, no provenance fields at all.
+  const posted = { name: 'almond milk', proposal_index: 0 };
+  const merged = withStagedProvenance(posted, staged);
+  assert.equal(merged.confidence, 0.93);
+  assert.equal(merged.confidence_note, 'clean carton label');
+  assert.equal(merged.model_used, 'opus');
+});
+
+test('withStagedProvenance lets an explicit client value win', () => {
+  const staged = [{ confidence: 0.93, confidence_note: 'agent note', model_used: 'opus' }];
+  const merged = withStagedProvenance({ proposal_index: 0, confidence: 0.4 }, staged);
+  assert.equal(merged.confidence, 0.4);
+});
+
+test('withStagedProvenance is a no-op for an unknown or missing index', () => {
+  const staged = [{ confidence: 0.93 }];
+  assert.equal(withStagedProvenance({ name: 'x' }, staged).confidence, undefined);
+  assert.equal(withStagedProvenance({ name: 'x', proposal_index: 7 }, staged).confidence, undefined);
+  assert.equal(withStagedProvenance({ name: 'x', proposal_index: 0 }, []).confidence, undefined);
+});
+
+test('a confirmed item carries the staged confidence end to end', () => {
+  const staged = [{ confidence: 0.88, confidence_note: 'label read cleanly', model_used: 'opus' }];
+  const posted = { ...samplePantryInput(), proposal_index: 0 };
+  delete posted.confidence;
+  delete posted.model_used;
+  const { content } = validateAndCleanPantryItem(withStagedProvenance(posted, staged));
+  assert.equal(content.confidence, 0.88);
+  assert.equal(content.confidence_note, 'label read cleanly');
+  assert.equal(content.model_used, 'opus');
 });
 
 // --- Pantry: index & matching ---------------------------------------------

@@ -586,6 +586,17 @@ textarea { resize: vertical; }
 .pantry-card-toggle input { width: auto; }
 .pantry-card-fields { display: grid; gap: 0.1rem; }
 
+/* An item whose label rounds every macro to zero (FR-20 rounding floor). */
+.pf-warning {
+  margin: 0 0 0.7rem;
+  padding: 0.55rem 0.7rem;
+  border-radius: 8px;
+  background: rgba(200, 120, 0, 0.12);
+  border: 1px solid rgba(200, 120, 0, 0.35);
+  font-size: 0.8rem;
+  line-height: 1.35;
+}
+
 .pf-basis-row, .pf-size-row {
   display: grid;
   grid-template-columns: 1fr 5rem 4rem;

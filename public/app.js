@@ -487,6 +487,9 @@ function readAcceptedPantryItems() {
     if (!accept || !accept.checked) return;
     const item = readPantryItemFields(card);
     if (!item.name) return;
+    // Tells the server which staged proposal this card came from so it can
+    // restore the agent's confidence, which this form does not round-trip.
+    if (card.dataset.proposal !== undefined) item.proposal_index = Number(card.dataset.proposal);
     const existing = card.dataset.existingId;
     if (existing) item.existing_item_id = existing;
     try { item.media_refs = JSON.parse(card.dataset.media || '[]'); } catch (e) { item.media_refs = []; }
@@ -885,7 +888,13 @@ function pantryItemFieldsHtml(item) {
         <input type="number" inputmode="decimal" step="any" data-pf="nutrient" value="${v.value != null ? v.value : ''}" placeholder="${nu.key === 'fiber_g' ? '—' : '0'}">
       </div>`;
   }).join('');
+  const floorWarning = item.rounding_floor
+    ? `<p class="pf-warning">⚠︎ Every macro on this label rounds to zero at its serving size, so these
+       per-${basis.unit} values would make this food free at any amount. Enter real values if you know
+       them, or save it knowing it will not count.</p>`
+    : '';
   return `
+    ${floorWarning}
     <label class="field-label">Name<input type="text" data-pf="name" value="${escapeAttr(item.name || '')}" placeholder="e.g. almond milk, unsweetened"></label>
     <label class="field-label" style="margin-top:0.6rem;">Brand<input type="text" data-pf="brand" value="${escapeAttr(item.brand || '')}" placeholder="optional"></label>
     <label class="field-label" style="margin-top:0.6rem;">Aliases <span class="muted">— comma separated</span><input type="text" data-pf="aliases" value="${escapeAttr((item.aliases || []).join(', '))}" placeholder="almond milk, the alpro one"></label>
@@ -1041,6 +1050,7 @@ function renderPantryItemDetail(container, item) {
 
     <div class="card">
       <p class="section-title">Nutrition <span class="muted">${escapeHtml(basisLabel)}</span></p>
+      ${item.rounding_floor ? '<p class="pf-warning">⚠︎ Rounding floor: this label reports zero for every macro, so this item contributes nothing to a meal at any amount.</p>' : ''}
       ${NUTRIENTS.map((n) => nutrientDetailRow(n, item.nutrition[n.key])).join('')}
       ${sizeLine ? `<p class="muted" style="margin:0.6rem 0 0;">${escapeHtml(sizeLine)}</p>` : ''}
     </div>
@@ -1048,6 +1058,7 @@ function renderPantryItemDetail(container, item) {
     <div class="card muted" style="font-size:0.75rem;">
       Source: ${escapeHtml(item.source || 'n/a')} · added ${escapeHtml(item.added_via || 'n/a')}${item.confidence != null ? ` · ${Math.round(item.confidence * 100)}% confident` : ''}<br>
       Verified ${escapeHtml(item.last_verified || 'n/a')} · model ${escapeHtml(item.model_used || 'n/a')}
+      ${item.confidence_note ? `<br>${escapeHtml(item.confidence_note)}` : ''}
     </div>
 
     <div class="action-row">
@@ -1084,6 +1095,10 @@ function renderPantryItemEdit(container, item) {
     const btn = document.getElementById('save-item-edit');
     const payload = readPantryItemFields(document.getElementById('pantry-edit-fields'));
     payload.source = item.source || 'label-photo';
+    // Carry provenance across the edit so correcting a value never blanks it.
+    payload.confidence = item.confidence;
+    payload.confidence_note = item.confidence_note || '';
+    payload.model_used = item.model_used || '';
     if (!payload.name) { await showMessage('An item needs a name.'); return; }
     btn.disabled = true;
     try {
