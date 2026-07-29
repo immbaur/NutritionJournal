@@ -8,12 +8,14 @@ const { spawn } = require('child_process');
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = path.join(__dirname, 'data');
 const MEALS_DIR = path.join(DATA_DIR, 'meals');
+const PANTRY_DIR = path.join(DATA_DIR, 'pantry');
 const AGENT_WORKSPACE_DIR = path.join(DATA_DIR, 'agent-workspace');
 const HISTORY_CSV_PATH = path.join(DATA_DIR, 'intake-history.csv');
 const AUTH_PATH = path.join(DATA_DIR, 'auth.json');
 const SESSIONS_PATH = path.join(DATA_DIR, 'sessions.json');
 const TEMPLATES_DIR = path.join(__dirname, 'templates');
 const ANALYZE_PROMPT_PATH = path.join(TEMPLATES_DIR, 'ANALYZE_INTAKE_PROMPT.md');
+const EXTRACT_ITEM_PROMPT_PATH = path.join(TEMPLATES_DIR, 'EXTRACT_ITEM_PROMPT.md');
 
 const AGENT_MODEL = process.env.NJ_MODEL || 'opus';
 const ANALYSIS_TIMEOUT_MS = 5 * 60 * 1000;
@@ -67,8 +69,24 @@ const LIMITS = {
   locationName: 120,
   confidenceNote: 400,
   modelUsed: 60,
-  mealText: 4000
+  mealText: 4000,
+  // Pantry
+  itemBrand: 80,
+  alias: 80,
+  maxAliases: 20,
+  maxPantryItems: 40 // per one deliberate "New Item" submission
 };
+
+// Basis / serving / package units. Nutrition is stored on a canonical per-100
+// basis (FR-20); solids per 100 g, liquids per 100 ml.
+const CANONICAL_UNITS = ['g', 'ml'];
+// Amounts a meal can reference a pantry item by. g/ml resolve directly against
+// the basis; serving/package resolve via the item's serving/package size.
+const AMOUNT_UNITS = ['g', 'ml', 'serving', 'package'];
+const PANTRY_SOURCES = ['label-photo', 'user-stated'];
+const PANTRY_ADDED_VIA = ['manual', 'meal-auto'];
+// Where an item's numbers in a meal came from (FR-5, items[].origin).
+const ITEM_ORIGINS = ['pantry', 'label', 'user-stated', 'estimate'];
 
 // Multiple photos + one audio clip per entry (FR-1). Caps keep a stray upload
 // from filling the disk; personal single-user app, so they can stay generous.
@@ -90,9 +108,14 @@ const AUDIO_EXT = {
 const ENTRY_ID_RE = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}__[0-9a-f]{6}$/;
 const STAGING_ID_RE = /^\d{13}-[0-9a-f]{6}$/;
 const MEDIA_NAME_RE = /^[A-Za-z0-9._-]+$/;
+// item_id is a slug plus a short random suffix, e.g. almond-milk-alpro__7f3a91,
+// stable for the item's lifetime so meals can reference it. (§6.4) Also guards
+// path traversal on data/pantry/.
+const ITEM_ID_RE = /^[a-z0-9-]+__[0-9a-f]{6}$/;
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(MEALS_DIR)) fs.mkdirSync(MEALS_DIR, { recursive: true });
+if (!fs.existsSync(PANTRY_DIR)) fs.mkdirSync(PANTRY_DIR, { recursive: true });
 if (!fs.existsSync(AGENT_WORKSPACE_DIR)) fs.mkdirSync(AGENT_WORKSPACE_DIR, { recursive: true });
 
 // --- JSON file helpers ----------------------------------------------------
@@ -246,10 +269,28 @@ function cleanItems(input) {
     if (!raw || typeof raw !== 'object') continue;
     const name = cleanLine(raw.name, LIMITS.itemName).trim();
     if (!name) continue;
+    // origin records where the item's numbers came from (FR-5). pantry_item_id
+    // is kept only for a genuine pantry hit, for traceability (FR-29); the
+    // resolved values themselves already live in the meal's totals.
+    let origin = typeof raw.origin === 'string' ? raw.origin.trim().toLowerCase() : '';
+    if (!ITEM_ORIGINS.includes(origin)) origin = 'estimate';
+    let pantryItemId = null;
+    if (origin === 'pantry' && typeof raw.pantry_item_id === 'string' && ITEM_ID_RE.test(raw.pantry_item_id)) {
+      pantryItemId = raw.pantry_item_id;
+    }
+    if (origin === 'pantry' && !pantryItemId) origin = 'estimate';
+    // Snapshot of the matched item's display name, so a saved meal stays a
+    // self-contained record even if that pantry item is later renamed. (FR-29)
+    const pantryName = origin === 'pantry'
+      ? cleanLine(raw.pantry_name || raw.matched_name, LIMITS.itemName).trim()
+      : '';
     items.push({
       name,
       amount: cleanLine(raw.amount, LIMITS.itemAmount).trim(),
-      source: cleanLine(raw.source, LIMITS.itemSource).trim()
+      source: cleanLine(raw.source, LIMITS.itemSource).trim(),
+      origin,
+      pantry_item_id: pantryItemId,
+      pantry_name: pantryName
     });
     if (items.length >= LIMITS.maxItems) break;
   }
@@ -378,6 +419,349 @@ function dayView(date, meals) {
     totals: roundTotals(totals),
     meals: dayMeals.map(summariseMeal)
   };
+}
+
+// --- Pantry (known-items store) -------------------------------------------
+// The pantry mirrors the meal store: one folder per item under
+// data/pantry/<item_id>/, item.json as the source of truth, label photo(s)
+// beside it. Nutrition is stored on a canonical per-100 g / per-100 ml basis
+// (FR-20). Only label-grade evidence may create an item (FR-23); the server —
+// never the model — does the arithmetic that turns stored facts into a meal
+// contribution (FR-22a).
+
+function slugify(str) {
+  return String(str || '')
+    .toLowerCase()
+    .normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48)
+    .replace(/-+$/g, '');
+}
+
+function makeItemId(name, brand, d = new Date()) {
+  const base = slugify([name, brand].filter(Boolean).join('-')) || 'item';
+  return `${base}__${crypto.randomBytes(3).toString('hex')}`;
+}
+
+// Cleans a { amount, unit } pair (basis / serving size / package size). Returns
+// the clean copy or null when absent/invalid, so optional sizes stay optional.
+function cleanAmountUnit(input, allowedUnits, defaultUnit) {
+  const obj = input && typeof input === 'object' ? input : {};
+  const amount = Number(obj.amount);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  let unit = typeof obj.unit === 'string' ? obj.unit.trim().toLowerCase() : '';
+  if (!allowedUnits.includes(unit)) unit = defaultUnit;
+  return { amount: Math.round(amount * 100) / 100, unit };
+}
+
+// Per-100 nutrient for a pantry item: a single { value, unit } (no low/high —
+// a label value is a fact, not a range). Required nutrients must be present;
+// fiber may be null (FR-20, never guessed).
+function cleanPantryNutrient(input, cfg) {
+  const obj = input && typeof input === 'object' ? input : {};
+  if (obj.value == null || obj.value === '') {
+    if (cfg.required) return { error: `${cfg.key}: a per-basis value is required.` };
+    return { nutrient: { value: null, unit: cfg.unit } };
+  }
+  const n = Number(obj.value);
+  if (!Number.isFinite(n) || n < 0) return { error: `${cfg.key}: value must be a non-negative number.` };
+  return { nutrient: { value: Math.round(Math.min(n, cfg.max) * 100) / 100, unit: cfg.unit } };
+}
+
+function cleanAliases(input) {
+  if (!Array.isArray(input)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const raw of input) {
+    const a = cleanLine(raw, LIMITS.alias).trim();
+    if (!a) continue;
+    const key = a.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(a);
+    if (out.length >= LIMITS.maxAliases) break;
+  }
+  return out;
+}
+
+// Validates the editable content of a pantry item (agent proposal or client
+// edit) into a whitelisted copy — server owns item_id, timestamps, media_refs,
+// added_via, etc. Returns { content } or { error }.
+function validateAndCleanPantryItem(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return { error: 'Item must be an object.' };
+  }
+  const name = cleanLine(input.name, LIMITS.itemName).trim();
+  if (!name) return { error: 'Item name is required.' };
+
+  const basis = cleanAmountUnit(input.basis, CANONICAL_UNITS, 'g');
+  if (!basis) return { error: 'A basis amount and unit (per 100 g or 100 ml) are required.' };
+
+  const nutritionInput = input.nutrition && typeof input.nutrition === 'object' ? input.nutrition : {};
+  const nutrition = {};
+  for (const cfg of NUTRIENTS) {
+    const { nutrient, error } = cleanPantryNutrient(nutritionInput[cfg.key], cfg);
+    if (error) return { error };
+    nutrition[cfg.key] = nutrient;
+  }
+
+  let source = typeof input.source === 'string' ? input.source.trim().toLowerCase() : '';
+  if (!PANTRY_SOURCES.includes(source)) source = 'label-photo';
+
+  return {
+    content: {
+      name,
+      brand: cleanLine(input.brand, LIMITS.itemBrand).trim(),
+      aliases: cleanAliases(input.aliases),
+      basis,
+      nutrition,
+      serving_size: cleanAmountUnit(input.serving_size, CANONICAL_UNITS, basis.unit),
+      package_size: cleanAmountUnit(input.package_size, CANONICAL_UNITS, basis.unit),
+      source,
+      confidence: cleanConfidence(input.confidence),
+      confidence_note: cleanLine(input.confidence_note, LIMITS.confidenceNote),
+      model_used: cleanLine(input.model_used, LIMITS.modelUsed) || AGENT_MODEL
+    }
+  };
+}
+
+// Reads every item.json under data/pantry/, most-recently-used first — the
+// order the match tie-break (FR-22) and the pantry screen both want.
+function listPantry() {
+  let ids;
+  try {
+    ids = fs.readdirSync(PANTRY_DIR);
+  } catch (err) {
+    return [];
+  }
+  const items = [];
+  for (const id of ids) {
+    if (!ITEM_ID_RE.test(id)) continue;
+    const item = readJson(path.join(PANTRY_DIR, id, 'item.json'));
+    if (item && item.item_id) items.push(item);
+  }
+  const key = (it) => String(it.last_used_at || it.updated_at || it.created_at || '');
+  items.sort((a, b) => (key(a) < key(b) ? 1 : -1));
+  return items;
+}
+
+// The compact index injected into the analysis prompt (FR-21): just enough for
+// the agent to match items and return a `pantry_item_id` reference — never the
+// stored numbers, which the server resolves itself.
+function buildPantryIndex(items) {
+  return items.map((it) => ({
+    id: it.item_id,
+    name: it.name,
+    brand: it.brand || '',
+    aliases: it.aliases || [],
+    basis: it.basis
+  }));
+}
+
+// FR-25: on a deliberate add, offer to update an existing entry rather than
+// create a near-duplicate. Match on name (+ brand) case-insensitively.
+function findMatchingPantryItem(name, brand, items) {
+  const n = String(name || '').trim().toLowerCase();
+  const b = String(brand || '').trim().toLowerCase();
+  if (!n) return null;
+  return items.find((it) =>
+    String(it.name).trim().toLowerCase() === n &&
+    String(it.brand || '').trim().toLowerCase() === b) || null;
+}
+
+// FR-22a: turn a stored per-100 item + a stated amount into this meal's
+// nutrition contribution. The server does this multiplication, not the model.
+// amountUsed = { amount, unit }, unit in AMOUNT_UNITS. Returns { nutrition,
+// factor, origin, estimated, note } or null when it cannot be resolved.
+function resolvePantryContribution(item, amountUsed) {
+  const basis = item && item.basis;
+  const amt = amountUsed && Number(amountUsed.amount);
+  const unit = amountUsed && typeof amountUsed.unit === 'string' ? amountUsed.unit.toLowerCase() : '';
+  if (!basis || !Number.isFinite(basis.amount) || basis.amount <= 0) return null;
+  if (!Number.isFinite(amt) || amt <= 0) return null;
+
+  let baseAmount = null; // amount expressed in some g/ml unit
+  let baseUnit = null;
+  let estimated = false;
+  let note = '';
+
+  if (unit === basis.unit) {
+    baseAmount = amt; baseUnit = unit;
+  } else if (unit === 'serving' && item.serving_size && item.serving_size.amount) {
+    baseAmount = amt * item.serving_size.amount; baseUnit = item.serving_size.unit;
+  } else if (unit === 'package' && item.package_size && item.package_size.amount) {
+    baseAmount = amt * item.package_size.amount; baseUnit = item.package_size.unit;
+  } else if (unit === 'g' || unit === 'ml') {
+    baseAmount = amt; baseUnit = unit;
+  } else {
+    return null; // serving/package requested but no such size stored
+  }
+
+  // A g↔ml mismatch would need a density the app doesn't have: don't fake it,
+  // flag it as an estimate instead. (FR-27)
+  if (baseUnit !== basis.unit) {
+    estimated = true;
+    note = `unit mismatch (${baseUnit} vs per-${basis.unit} basis): density unknown, treated as an estimate`;
+  }
+
+  const factor = baseAmount / basis.amount;
+  const nutrition = {};
+  for (const cfg of NUTRIENTS) {
+    const stored = item.nutrition && item.nutrition[cfg.key];
+    const v = stored && stored.value;
+    if (typeof v === 'number' && Number.isFinite(v)) {
+      nutrition[cfg.key] = { value: Math.round(v * factor * 100) / 100, low: null, high: null, unit: cfg.unit };
+    } else {
+      nutrition[cfg.key] = { value: cfg.required ? 0 : null, low: null, high: null, unit: cfg.unit };
+    }
+  }
+  return { nutrition, factor, origin: estimated ? 'estimate' : 'pantry', estimated, note };
+}
+
+// Adds one item's resolved nutrition contribution into a meal nutrition object
+// in place. Used when composing a meal total from agent estimate + pantry facts.
+function addNutritionInto(nutrition, contribution) {
+  for (const cfg of NUTRIENTS) {
+    const c = contribution && contribution[cfg.key];
+    if (!c || typeof c.value !== 'number' || !Number.isFinite(c.value)) continue;
+    const cur = nutrition[cfg.key] || { value: cfg.required ? 0 : null, low: null, high: null, unit: cfg.unit };
+    const base = typeof cur.value === 'number' && Number.isFinite(cur.value) ? cur.value : 0;
+    nutrition[cfg.key] = { ...cur, value: Math.round((base + c.value) * 100) / 100, unit: cfg.unit };
+  }
+}
+
+// Updates last_used_at on a referenced pantry item (FR-22 tie-break). Called by
+// the server on meal confirm — the agent never writes the pantry (FR-30).
+function touchPantryItemUsed(itemId, when) {
+  if (!ITEM_ID_RE.test(itemId)) return;
+  const p = path.join(PANTRY_DIR, itemId, 'item.json');
+  const item = readJson(p);
+  if (!item) return;
+  item.last_used_at = when || localParts().timestamp;
+  writeJson(p, item);
+}
+
+// Copies label photo(s) from srcDir into an item folder as label-N.ext, so the
+// pantry stays independently self-contained (copies, not moves — the meal keeps
+// its own). Returns the destination names, appended after startIndex. (FR-12b)
+function copyLabelPhotos(itemDir, srcDir, mediaRefs, startIndex) {
+  const out = [];
+  let i = startIndex || 0;
+  for (const name of mediaRefs || []) {
+    if (!MEDIA_NAME_RE.test(name)) continue;
+    const src = path.join(srcDir, name);
+    if (!fs.existsSync(src)) continue;
+    const ext = (path.extname(name).replace('.', '') || 'jpg').toLowerCase();
+    const destName = `label-${i + 1}.${ext}`;
+    try {
+      fs.copyFileSync(src, path.join(itemDir, destName));
+      out.push(destName);
+      i += 1;
+    } catch (err) { /* skip an unreadable source; item still saves */ }
+  }
+  return out;
+}
+
+// Writes a brand-new pantry item folder (§6.4). The server — not the agent —
+// owns item_id, provenance, and timestamps (FR-30). opts: { addedVia,
+// addedFromEntryId, srcDir, mediaRefs }.
+function createPantryItem(content, opts = {}) {
+  const now = localParts();
+  const itemId = makeItemId(content.name, content.brand);
+  const itemDir = path.join(PANTRY_DIR, itemId);
+  fs.mkdirSync(itemDir, { recursive: true });
+  const mediaRefs = opts.srcDir ? copyLabelPhotos(itemDir, opts.srcDir, opts.mediaRefs, 0) : [];
+  const item = {
+    item_id: itemId,
+    name: content.name,
+    brand: content.brand,
+    aliases: content.aliases,
+    basis: content.basis,
+    nutrition: content.nutrition,
+    serving_size: content.serving_size,
+    package_size: content.package_size,
+    source: content.source,
+    added_via: PANTRY_ADDED_VIA.includes(opts.addedVia) ? opts.addedVia : 'manual',
+    added_from_entry_id: opts.addedFromEntryId || null,
+    confidence: content.confidence,
+    confidence_note: content.confidence_note,
+    model_used: content.model_used,
+    media_refs: mediaRefs,
+    last_verified: now.date,
+    last_used_at: null,
+    schema_version: SCHEMA_VERSION,
+    created_at: now.timestamp,
+    updated_at: now.timestamp
+  };
+  writeJson(path.join(itemDir, 'item.json'), item);
+  return item;
+}
+
+// Refreshes an existing item's values, optional new media, and last_verified
+// (FR-25). Preserves item_id, provenance, and created_at. Returns the updated
+// item, or null if the id is unknown.
+function updatePantryItem(itemId, content, opts = {}) {
+  if (!ITEM_ID_RE.test(itemId)) return null;
+  const itemDir = path.join(PANTRY_DIR, itemId);
+  const existing = readJson(path.join(itemDir, 'item.json'));
+  if (!existing) return null;
+  const now = localParts();
+  let mediaRefs = Array.isArray(existing.media_refs) ? existing.media_refs.slice() : [];
+  if (opts.srcDir && (opts.mediaRefs || []).length) {
+    mediaRefs = mediaRefs.concat(copyLabelPhotos(itemDir, opts.srcDir, opts.mediaRefs, mediaRefs.length));
+  }
+  const updated = {
+    ...existing,
+    name: content.name,
+    brand: content.brand,
+    aliases: content.aliases,
+    basis: content.basis,
+    nutrition: content.nutrition,
+    serving_size: content.serving_size,
+    package_size: content.package_size,
+    source: content.source,
+    confidence: content.confidence,
+    confidence_note: content.confidence_note,
+    model_used: content.model_used,
+    media_refs: mediaRefs,
+    last_verified: now.date,
+    updated_at: now.timestamp
+  };
+  writeJson(path.join(itemDir, 'item.json'), updated);
+  return updated;
+}
+
+// Persists the accepted pantry items from a review step: updates when the client
+// (or the agent's match) points at an existing id, otherwise creates. Shared by
+// the meal on-the-fly path and the deliberate New Item flow. Returns a short
+// summary list [{ item_id, name, updated }] for the UI's confirmation message.
+function savePantryItems(accepted, opts = {}) {
+  const saved = [];
+  if (!Array.isArray(accepted)) return saved;
+  for (const raw of accepted) {
+    const { content } = validateAndCleanPantryItem(raw);
+    if (!content) continue;
+    const mediaRefs = (Array.isArray(raw.media_refs) ? raw.media_refs : [])
+      .filter((n) => typeof n === 'string' && MEDIA_NAME_RE.test(n));
+    const targetId = typeof raw.existing_item_id === 'string' && ITEM_ID_RE.test(raw.existing_item_id)
+      ? raw.existing_item_id : null;
+    let item = null;
+    if (targetId) {
+      item = updatePantryItem(targetId, content, { srcDir: opts.srcDir, mediaRefs });
+    }
+    if (!item) {
+      item = createPantryItem(content, {
+        addedVia: opts.addedVia,
+        addedFromEntryId: opts.addedFromEntryId,
+        srcDir: opts.srcDir,
+        mediaRefs
+      });
+    }
+    saved.push({ item_id: item.item_id, name: item.name, brand: item.brand || '', updated: !!targetId });
+    if (saved.length >= LIMITS.maxPantryItems) break;
+  }
+  return saved;
 }
 
 // --- CSV export -----------------------------------------------------------
@@ -612,29 +996,130 @@ function sweepStaging() {
 // The server validates that JSON; nothing is written to data/meals/ until the
 // user confirms.
 
-function getAnalyzePromptText(meta) {
-  const raw = fs.readFileSync(ANALYZE_PROMPT_PATH, 'utf8');
+// The body of a prompt template is everything after the first `\n---\n`; the
+// preamble above it is human documentation for running the prompt by hand.
+function promptBody(templatePath) {
+  const raw = fs.readFileSync(templatePath, 'utf8');
   const marker = '\n---\n';
   const idx = raw.indexOf(marker);
-  const template = idx === -1 ? raw : raw.slice(idx + marker.length).trim();
-  const photoList = meta.photos.length
-    ? meta.photos.map((p) => `- ${p}`).join('\n')
-    : '- (none)';
-  const audioLine = meta.audio ? meta.audio : '(none)';
-  const noteLine = meta.hasNote ? 'note.txt' : '(none)';
+  return idx === -1 ? raw : raw.slice(idx + marker.length).trim();
+}
+
+function mediaLines(meta) {
+  return {
+    photoList: meta.photos.length ? meta.photos.map((p) => `- ${p}`).join('\n') : '- (none)',
+    audioLine: meta.audio ? meta.audio : '(none)',
+    noteLine: meta.hasNote ? 'note.txt' : '(none)'
+  };
+}
+
+function getAnalyzePromptText(meta) {
+  const template = promptBody(ANALYZE_PROMPT_PATH);
+  const { photoList, audioLine, noteLine } = mediaLines(meta);
+  // Inject the pantry index (FR-21): id / name / brand / aliases / basis only —
+  // never the stored numbers, which the server resolves itself (FR-22a).
+  const index = buildPantryIndex(listPantry());
+  const pantryBlock = index.length
+    ? JSON.stringify(index, null, 2)
+    : '(the pantry is empty — no known items to match against yet)';
+  return template
+    .replace('{{PHOTO_LIST}}', photoList)
+    .replace('{{AUDIO_FILE}}', audioLine)
+    .replace('{{NOTE_FILE}}', noteLine)
+    .replace('{{PANTRY_INDEX}}', pantryBlock);
+}
+
+function getExtractPromptText(meta) {
+  const template = promptBody(EXTRACT_ITEM_PROMPT_PATH);
+  const { photoList, audioLine, noteLine } = mediaLines(meta);
   return template
     .replace('{{PHOTO_LIST}}', photoList)
     .replace('{{AUDIO_FILE}}', audioLine)
     .replace('{{NOTE_FILE}}', noteLine);
 }
 
+// Reads a { amount, unit } portion reference the agent attached to a pantry hit.
+// unit must be one of AMOUNT_UNITS; the server resolves it against the stored
+// item (FR-22a). Returns null when unusable.
+function cleanAmountUsed(input) {
+  const obj = input && typeof input === 'object' ? input : {};
+  const amount = Number(obj.amount);
+  const unit = typeof obj.unit === 'string' ? obj.unit.trim().toLowerCase() : '';
+  if (!Number.isFinite(amount) || amount <= 0 || !AMOUNT_UNITS.includes(unit)) return null;
+  return { amount, unit };
+}
+
+// Server-side pantry resolution for a meal analysis (FR-22a). Mutates the raw
+// agent output in place: for each item the agent tagged origin=pantry with a
+// real id, it adds that item's stored-fact contribution to the meal totals and
+// records the matched name. Returns validated new-item proposals (FR-23) to
+// show as editable cards in review — written only on confirm.
+function applyPantryToRawOutput(output, meta) {
+  const pantryItems = listPantry();
+  const byId = new Map(pantryItems.map((it) => [it.item_id, it]));
+  const knownPhotos = new Set((meta && meta.photos) || []);
+
+  if (!output.nutrition || typeof output.nutrition !== 'object') output.nutrition = {};
+  const rawItems = Array.isArray(output.items) ? output.items : [];
+  for (const raw of rawItems) {
+    if (!raw || typeof raw !== 'object') continue;
+    const origin = typeof raw.origin === 'string' ? raw.origin.trim().toLowerCase() : '';
+    if (origin !== 'pantry') continue;
+    const pi = raw.pantry_item_id && byId.get(raw.pantry_item_id);
+    if (!pi) { raw.origin = 'estimate'; raw.pantry_item_id = null; continue; }
+    const resolved = resolvePantryContribution(pi, cleanAmountUsed(raw.amount_used));
+    if (!resolved) { raw.origin = 'estimate'; raw.pantry_item_id = null; continue; }
+    addNutritionInto(output.nutrition, resolved.nutrition);
+    raw.origin = resolved.origin; // may downgrade to 'estimate' on a unit mismatch (FR-27)
+    raw.pantry_name = pi.brand ? `${pi.name} — ${pi.brand}` : pi.name;
+  }
+
+  const proposals = [];
+  const rawProps = Array.isArray(output.proposed_pantry_items) ? output.proposed_pantry_items : [];
+  for (const rawProp of rawProps) {
+    const { content } = validateAndCleanPantryItem(rawProp);
+    if (!content) continue;
+    // Only label-grade evidence may create an item (FR-23). The label photo(s)
+    // the proposal points at must be real uploads from this meal.
+    const mediaRefs = (Array.isArray(rawProp.media_refs) ? rawProp.media_refs : [])
+      .filter((n) => typeof n === 'string' && knownPhotos.has(n));
+    const existing = findMatchingPantryItem(content.name, content.brand, pantryItems);
+    proposals.push({ ...content, media_refs: mediaRefs, existing_item_id: existing ? existing.item_id : null });
+    if (proposals.length >= LIMITS.maxPantryItems) break;
+  }
+  return proposals;
+}
+
+// Validates the agent's item-extraction output for the deliberate "New Item"
+// flow (§8.1): one submission may carry several labels → several items (FR-24).
+function postProcessItemExtraction(output, meta) {
+  const pantryItems = listPantry();
+  const knownPhotos = new Set((meta && meta.photos) || []);
+  const rawItems = Array.isArray(output.items) ? output.items : [];
+  const items = [];
+  for (const raw of rawItems) {
+    const { content } = validateAndCleanPantryItem(raw);
+    if (!content) continue;
+    const mediaRefs = (Array.isArray(raw.media_refs) ? raw.media_refs : [])
+      .filter((n) => typeof n === 'string' && knownPhotos.has(n));
+    const existing = findMatchingPantryItem(content.name, content.brand, pantryItems);
+    items.push({ ...content, media_refs: mediaRefs, existing_item_id: existing ? existing.item_id : null });
+    if (items.length >= LIMITS.maxPantryItems) break;
+  }
+  return items;
+}
+
+// kind === 'item' runs the extract-item prompt (New Item flow); anything else
+// runs the meal-analysis prompt with the pantry injected.
 function startAnalysis(stagingId) {
   const dir = stagingDir(stagingId);
   const meta = readJson(path.join(dir, 'meta.json'));
   if (!meta) return;
+  const kind = meta.kind === 'item' ? 'item' : 'meal';
 
   writeStagingStatus(stagingId, {
     status: 'analyzing',
+    kind,
     createdAt: (readStagingStatus(stagingId) || {}).createdAt || Date.now(),
     startedAt: Date.now()
   });
@@ -642,7 +1127,7 @@ function startAnalysis(stagingId) {
   const existing = runningAnalyses.get(stagingId);
   if (existing) existing.kill('SIGTERM');
 
-  const promptText = getAnalyzePromptText(meta);
+  const promptText = kind === 'item' ? getExtractPromptText(meta) : getAnalyzePromptText(meta);
   let child;
   try {
     child = spawn('claude', ['-p', promptText, '--allowedTools', 'Read,Write', '--model', AGENT_MODEL], {
@@ -665,7 +1150,7 @@ function startAnalysis(stagingId) {
 
   const finish = (status) => {
     const base = readStagingStatus(stagingId) || {};
-    writeStagingStatus(stagingId, { ...status, createdAt: base.createdAt || Date.now() });
+    writeStagingStatus(stagingId, { kind, ...status, createdAt: base.createdAt || Date.now() });
   };
 
   child.on('close', (code) => {
@@ -685,6 +1170,20 @@ function startAnalysis(stagingId) {
       });
       return;
     }
+
+    if (kind === 'item') {
+      const items = postProcessItemExtraction(output, meta);
+      if (!items.length) {
+        finish({ status: 'error', message: 'No readable nutrition label was found in what you provided. A clear per-100 g / per-100 ml label (or stated values) is needed to add a pantry item.' });
+        return;
+      }
+      finish({ status: 'ready', items, analyzedAt: Date.now() });
+      return;
+    }
+
+    // Meal analysis: resolve pantry hits server-side (FR-22a) and collect any
+    // new-item proposals (FR-23) before validating the composed meal.
+    const proposals = applyPantryToRawOutput(output, meta);
     const { content, error } = validateAndCleanMeal(output);
     if (error) {
       finish({ status: 'error', message: `The agent produced an invalid estimate: ${error}` });
@@ -694,7 +1193,7 @@ function startAnalysis(stagingId) {
     // the agent; the user can still override it in review. (FR-13)
     content.meal_type = classifyMealType();
     content.model_used = content.model_used || AGENT_MODEL;
-    finish({ status: 'ready', result: content, analyzedAt: Date.now() });
+    finish({ status: 'ready', result: content, proposed_pantry_items: proposals, analyzedAt: Date.now() });
   });
 
   child.on('error', (err) => {
@@ -717,7 +1216,7 @@ function pickExt(file, table, fallback) {
 // Writes uploaded photos/audio/text into the staging dir with canonical names
 // (photo-1.jpg, audio.webm, note.txt) and records them in meta.json. Returns
 // the meta describing what was stored.
-function persistUploads(dir, files, text) {
+function persistUploads(dir, files, text, kind = 'meal') {
   const photos = [];
   (files.photos || []).slice(0, MAX_PHOTOS).forEach((file, i) => {
     const name = `photo-${i + 1}.${pickExt(file, IMAGE_EXT, 'jpg')}`;
@@ -736,7 +1235,7 @@ function persistUploads(dir, files, text) {
   const hasNote = note.trim().length > 0;
   if (hasNote) fs.writeFileSync(path.join(dir, 'note.txt'), note);
 
-  const meta = { photos, audio, hasNote, note, createdAt: Date.now() };
+  const meta = { kind: kind === 'item' ? 'item' : 'meal', photos, audio, hasNote, note, createdAt: Date.now() };
   writeJson(path.join(dir, 'meta.json'), meta);
   return meta;
 }
@@ -852,8 +1351,11 @@ app.get('/api/intake/:id', (req, res) => {
   res.json({
     staging_id: stagingId,
     status: status.status,
+    kind: status.kind || meta.kind || 'meal',
     message: status.message || '',
     result: status.result || null,
+    proposed_pantry_items: status.proposed_pantry_items || [],
+    items: status.items || [],
     media: { photos: meta.photos || [], audio: meta.audio || null, hasNote: !!meta.hasNote },
     note: meta.note || '',
     confidence_threshold: CONFIDENCE_THRESHOLD
@@ -972,8 +1474,29 @@ app.post('/api/intake/:id/confirm', (req, res) => {
   };
   writeJson(path.join(mealDir, 'meal.json'), meal);
 
+  // Bump last_used_at on every pantry item this meal referenced, so the
+  // most-recently-used tie-break stays meaningful. (FR-22) The agent never
+  // writes the pantry; the server does, here. (FR-30)
+  const touchedAt = parts.timestamp;
+  for (const item of meal.items) {
+    if (item.origin === 'pantry' && item.pantry_item_id) touchPantryItemUsed(item.pantry_item_id, touchedAt);
+  }
+
+  // Persist any new pantry items the user accepted in review (FR-8b, FR-23a).
+  // Their label photos are copied out of the meal folder so both stores stay
+  // independently self-contained. (FR-12b) Writing the pantry never blocks the
+  // meal — it is already safely saved above.
+  let pantryAdded = [];
+  try {
+    pantryAdded = savePantryItems((req.body || {}).pantry_items, {
+      addedVia: 'meal-auto',
+      addedFromEntryId: entryId,
+      srcDir: mealDir
+    });
+  } catch (err) { /* meal is saved; a pantry write failure must not lose it */ }
+
   removeStaging(stagingId);
-  res.json({ entry_id: entryId, date: meal.date });
+  res.json({ entry_id: entryId, date: meal.date, pantry_added: pantryAdded });
 });
 
 // Cancel/discard an intake: delete its staging dir immediately. (FR-12c)
@@ -1114,6 +1637,141 @@ app.get('/api/export/csv', (req, res) => {
   res.send(csv);
 });
 
+// --- Pantry routes --------------------------------------------------------
+
+function summarisePantryItem(item) {
+  return {
+    item_id: item.item_id,
+    name: item.name,
+    brand: item.brand || '',
+    aliases: item.aliases || [],
+    basis: item.basis,
+    nutrition: item.nutrition,
+    serving_size: item.serving_size || null,
+    package_size: item.package_size || null,
+    source: item.source || '',
+    added_via: item.added_via || '',
+    confidence: item.confidence != null ? item.confidence : null,
+    last_verified: item.last_verified || '',
+    last_used_at: item.last_used_at || null,
+    media_refs: item.media_refs || []
+  };
+}
+
+// List the pantry, most-recently-used first, with an optional `q` search over
+// name / brand / aliases. (FR-28)
+app.get('/api/pantry', (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+  let items = listPantry();
+  if (q) {
+    items = items.filter((it) => {
+      const hay = [it.name, it.brand, ...(it.aliases || [])].join(' ').toLowerCase();
+      return hay.includes(q);
+    });
+  }
+  res.json({ items: items.map(summarisePantryItem), count: items.length });
+});
+
+// A single pantry item's full record. (FR-28)
+app.get('/api/pantry/:id', (req, res) => {
+  const id = req.params.id;
+  if (!ITEM_ID_RE.test(id)) return res.status(400).json({ error: 'Invalid id.' });
+  const item = readJson(path.join(PANTRY_DIR, id, 'item.json'));
+  if (!item) return res.status(404).json({ error: 'Item not found.' });
+  res.json(item);
+});
+
+// Edit a pantry item — any field, including aliases (FR-28). Rewrites only this
+// item's folder; saved meals keep their resolved values (FR-29).
+app.put('/api/pantry/:id', (req, res) => {
+  const id = req.params.id;
+  if (!ITEM_ID_RE.test(id)) return res.status(400).json({ error: 'Invalid id.' });
+  const { content, error } = validateAndCleanPantryItem(req.body);
+  if (error) return res.status(400).json({ error });
+  const updated = updatePantryItem(id, content);
+  if (!updated) return res.status(404).json({ error: 'Item not found.' });
+  res.json(updated);
+});
+
+// Delete a pantry item folder. Only this item is removed; past meals are
+// unaffected. (FR-28, FR-29)
+app.delete('/api/pantry/:id', (req, res) => {
+  const id = req.params.id;
+  if (!ITEM_ID_RE.test(id)) return res.status(400).json({ error: 'Invalid id.' });
+  const itemDir = path.join(PANTRY_DIR, id);
+  if (!fs.existsSync(itemDir)) return res.status(404).json({ error: 'Item not found.' });
+  fs.rmSync(itemDir, { recursive: true, force: true });
+  res.json({ ok: true });
+});
+
+// Serve a pantry item's label photo, guarded by media_refs.
+app.get('/api/pantry/:id/media/:name', (req, res) => {
+  const id = req.params.id;
+  const name = req.params.name;
+  if (!ITEM_ID_RE.test(id) || !MEDIA_NAME_RE.test(name)) {
+    return res.status(400).json({ error: 'Invalid request.' });
+  }
+  const item = readJson(path.join(PANTRY_DIR, id, 'item.json'));
+  if (!item || !(item.media_refs || []).includes(name)) {
+    return res.status(404).json({ error: 'Not found.' });
+  }
+  res.sendFile(path.join(PANTRY_DIR, id, name));
+});
+
+// Deliberate "New Item" flow (§8.1): upload photos/audio/text of one or more
+// product labels into a staging dir and run the extract-item agent. Reuses the
+// same staging poll (GET /api/intake/:id), media, rerun, and cancel routes.
+app.post('/api/pantry/intake', intakeUpload, (req, res) => {
+  const files = req.files || {};
+  const text = (req.body || {}).text || '';
+  const hasPhotos = (files.photos || []).length > 0;
+  const hasAudio = (files.audio || []).length > 0;
+  const hasText = typeof text === 'string' && text.trim().length > 0;
+  if (!hasPhotos && !hasAudio && !hasText) {
+    return res.status(400).json({ error: 'Add at least a label photo, an audio note, or some text.' });
+  }
+
+  const stagingId = `${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+  const dir = stagingDir(stagingId);
+  fs.mkdirSync(dir, { recursive: true });
+  writeStagingStatus(stagingId, { status: 'analyzing', kind: 'item', createdAt: Date.now() });
+
+  try {
+    persistUploads(dir, files, text, 'item');
+  } catch (err) {
+    removeStaging(stagingId);
+    return res.status(500).json({ error: `Could not save the upload: ${err.message}` });
+  }
+
+  startAnalysis(stagingId);
+  res.json({ staging_id: stagingId, status: 'analyzing' });
+});
+
+// Confirm the (possibly edited) extracted item(s): write each to data/pantry/,
+// copying its label photo(s) out of staging, then remove the staging dir.
+// (FR-24, FR-25) Updates an existing item when the client points at one.
+app.post('/api/pantry/intake/:id/confirm', (req, res) => {
+  const stagingId = req.params.id;
+  if (!isValidStagingId(stagingId)) return res.status(400).json({ error: 'Invalid id.' });
+  const dir = stagingDir(stagingId);
+  if (!fs.existsSync(dir)) return res.status(404).json({ error: 'This submission is no longer available.' });
+
+  const items = (req.body || {}).items;
+  if (!Array.isArray(items) || !items.length) {
+    return res.status(400).json({ error: 'No items to save.' });
+  }
+  let saved;
+  try {
+    saved = savePantryItems(items, { addedVia: 'manual', srcDir: dir });
+  } catch (err) {
+    return res.status(500).json({ error: `Could not save the item(s): ${err.message}` });
+  }
+  if (!saved.length) return res.status(400).json({ error: 'None of the items were valid.' });
+
+  removeStaging(stagingId);
+  res.json({ saved });
+});
+
 if (require.main === module) {
   initAuth();
   sweepStaging();
@@ -1148,8 +1806,21 @@ module.exports = {
   mealToCsvRow,
   buildHistoryCsv,
   listMeals,
+  slugify,
+  makeItemId,
+  cleanAmountUnit,
+  cleanPantryNutrient,
+  cleanAliases,
+  validateAndCleanPantryItem,
+  listPantry,
+  buildPantryIndex,
+  findMatchingPantryItem,
+  resolvePantryContribution,
+  addNutritionInto,
   NUTRIENTS,
   MEAL_TYPES,
+  ITEM_ORIGINS,
   MEALS_DIR,
+  PANTRY_DIR,
   HISTORY_CSV_PATH
 };

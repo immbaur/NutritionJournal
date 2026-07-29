@@ -532,3 +532,75 @@ textarea { resize: vertical; }
   cursor: pointer;
 }
 .menu-sheet button:active { background: var(--surface-2); }
+
+/* --- Origin badges (which numbers are facts vs guesses) --- */
+.origin-badge {
+  display: inline-block;
+  grid-column: 1 / -1;
+  justify-self: start;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  padding: 0.12rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  background: var(--surface-2);
+}
+.origin-badge.origin-pantry { color: var(--good); border-color: rgba(62, 207, 142, 0.4); background: rgba(62, 207, 142, 0.12); text-transform: none; }
+.origin-badge.origin-label { color: var(--fiber); border-color: rgba(56, 189, 248, 0.4); background: rgba(56, 189, 248, 0.12); }
+.origin-badge.origin-user-stated { color: var(--carbs); border-color: rgba(167, 139, 250, 0.4); background: rgba(167, 139, 250, 0.12); }
+.origin-badge.origin-estimate { color: var(--text-dim); }
+.detail-item .origin-badge { grid-column: auto; margin-left: 0.4rem; vertical-align: middle; }
+
+/* --- Pantry list --- */
+.pantry-search {
+  width: 100%;
+  padding: 0.7rem 0.85rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 10px;
+  margin-bottom: 0.75rem;
+  font-size: 0.95rem;
+}
+
+/* --- Pantry item editor cards --- */
+.pantry-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 0.9rem 1rem;
+  margin-bottom: 0.75rem;
+  background: var(--surface);
+}
+.pantry-card-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  font-size: 0.9rem;
+  color: var(--text);
+  margin-bottom: 0.6rem;
+}
+.pantry-card-toggle input { width: auto; }
+.pantry-card-fields { display: grid; gap: 0.1rem; }
+
+.pf-basis-row, .pf-size-row {
+  display: grid;
+  grid-template-columns: 1fr 5rem 4rem;
+  gap: 0.5rem;
+  align-items: center;
+  margin-top: 0.6rem;
+}
+.pf-basis-row input, .pf-size-row input, .pf-basis-row select, .pf-size-row select { padding: 0.5rem; }
+
+.pf-nutrients { margin-top: 0.6rem; display: grid; gap: 0.4rem; }
+.pf-nutrient {
+  display: grid;
+  grid-template-columns: 1fr 6rem;
+  gap: 0.5rem;
+  align-items: center;
+}
+.pf-nutrient .n-label { font-size: 0.85rem; color: var(--text-dim); }
+.pf-nutrient input { padding: 0.5rem; }

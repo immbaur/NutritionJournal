@@ -4,6 +4,9 @@ node_modules/
 *.log
 .env
 
+# Private ops/infra notes — never checked in (mirrors heyimmi.com)
+PRIVATE_INFRA.md
+
 # Personal nutrition data — generated at runtime, not checked in.
 # data/.gitkeep is tracked so the directory exists on a fresh clone.
 data/*

@@ -14,6 +14,12 @@ The app opens on a **daily dashboard** — today's running totals so far plus th
 day's meals — and lets you step back through yesterday, the day before, and a
 multi-day history to see how you've been eating over time.
 
+It also keeps a **pantry** of packaged products whose nutrition labels you've
+captured once. When a later meal mentions a known item ("50 ml almond milk"), its
+numbers are **computed from the stored label, not re-estimated** — so the things
+you buy repeatedly get measured once and reused exactly. See
+[Pantry](#pantry--known-items-store).
+
 No cloud hosting, no database, no build step — Node/Express serving static
 files + a few JSON/multipart endpoints, exposed with a Cloudflare quick tunnel
 so you can use it from your phone. It mirrors the [Momentum](../Momentum) app's
@@ -30,11 +36,22 @@ answers on the port, then prints a `https://xxxxx.trycloudflare.com` URL — tha
 your public link for the session. Leave the terminal open; closing it (or
 Ctrl+C) stops both the server and the tunnel. The URL changes every restart.
 
-To run without the tunnel (local only):
+### Local test server (no tunnel)
+
+To run it on your own machine without the Cloudflare tunnel — the quickest way to
+try it or develop against it:
 
 ```bash
-PORT=3100 npm start
+npm install                 # first time only
+NUTRITION_PASSWORD=test PORT=3100 npm start
 ```
+
+Then open <http://localhost:3100> and sign in with the password you set (here,
+`test`). Omit `NUTRITION_PASSWORD` and the server generates one and prints it to
+the terminal instead. `PORT` defaults to `3000`. The app writes everything under
+`data/` (gitignored); delete that folder to reset to a clean slate.
+
+To run the automated test suite instead of the server, see [Tests](#tests).
 
 ## Password / login
 
@@ -81,6 +98,39 @@ runs inside its own staging directory containing only that entry's inputs. The
 server schema-validates whatever the agent wrote before showing it to you, and
 validates every browser payload the same way before saving.
 
+## Pantry — known-items store
+
+The pantry turns "prefer explicit facts" into something that **persists across
+meals**: a nutrition label photographed once counts as a hard fact forever. Open
+it from the menu (**Pantry**).
+
+**Two ways items get in:**
+
+- **On the fly** — when a meal you log includes a photo of a nutrition label for a
+  product that isn't in your pantry yet, the review step offers an editable card
+  to **remember it**. It's saved only when you confirm the meal, and you're told
+  what was added. The pantry fills itself as a side effect of normal logging.
+- **Deliberately** — **Pantry → New Item** takes the same photos / audio / text as
+  a meal. Photograph the labels of what you bought (several at once), review the
+  extracted items, add aliases, and save. Products that match something you
+  already have are offered as an **update** instead of a duplicate.
+
+**Using an item:** at analysis time the server hands the agent a compact index of
+your pantry (id / name / brand / aliases / basis). The agent only **identifies**
+which items a meal used and reads the portion — **the server does the
+arithmetic** (stored per-100 g/ml values × the amount), so known numbers never
+route through the model. Each item in the review is tagged with its **origin**
+(`pantry` / `label` / `you stated` / `estimate`) so you can see at a glance which
+numbers are facts and which are guesses.
+
+Only **label-grade evidence** (a readable label, or values you state) can create a
+pantry item — a visual guess is never stored as a fact. Meals save the
+**resolved numbers** plus the `pantry_item_id` for traceability, so editing or
+deleting a pantry item later never rewrites meals you've already saved. Manage
+items (search, edit any field including aliases, delete) on the Pantry screen. The
+extraction agent's instructions live in
+[`templates/EXTRACT_ITEM_PROMPT.md`](templates/EXTRACT_ITEM_PROMPT.md).
+
 ## Storage — one folder per meal
 
 Each confirmed meal is its **own folder** under `data/meals/`:
@@ -99,6 +149,22 @@ history are computed on the fly from these files; there is no stored aggregate
 to keep in sync. The `<entry_id>` sorts chronologically, so listing
 `data/meals/` is time-ordered.
 
+The **pantry** uses the identical pattern under `data/pantry/`, one folder per
+item:
+
+```
+data/pantry/almond-milk-alpro__7f3a91/
+  item.json        # the structured item — the source of truth
+  label-1.jpg      # the nutrition-label photo(s) it was built from
+```
+
+The two stores are independently self-contained — there is no shared index or
+shared media. A meal may retain a pantry item's id for traceability, but it also
+stores the resolved nutrition values, so changing or deleting that pantry item
+cannot alter meal history. The match index the agent sees is built in memory from
+the item folders at analysis time, so there is nothing to keep in sync and nothing
+whose corruption could take out the pantry.
+
 ## CSV export
 
 The full history is a **derived** CSV — one row per meal, one column per
@@ -115,7 +181,8 @@ npm test
 ```
 
 Covers input/schema validation, meal-type classification, location matching,
-on-the-fly aggregation, and CSV generation.
+on-the-fly aggregation, CSV generation, and the pantry (item validation, id
+slugs, match lookup, and the server-side per-100 arithmetic).
 
 ## Hosting it permanently (DigitalOcean)
 

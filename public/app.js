@@ -9,8 +9,14 @@ const TITLES = {
   intake: 'New Intake',
   review: 'Review Estimate',
   history: 'History',
-  meal: 'Meal'
+  meal: 'Meal',
+  pantry: 'Pantry',
+  'pantry-new': 'New Item',
+  'pantry-review': 'Review Items',
+  'pantry-item': 'Pantry Item'
 };
+
+const PANTRY_VIEWS = ['pantry', 'pantry-new', 'pantry-review', 'pantry-item'];
 
 // The five tracked nutrients (FR-6). Order drives display everywhere.
 const NUTRIENTS = [
@@ -33,6 +39,8 @@ let reviewGeo = { lat: null, long: null };
 
 backBtn.addEventListener('click', () => {
   if (currentView === 'meal' || currentView === 'history') navigate('today', viewDate);
+  else if (currentView === 'pantry') navigate('today');
+  else if (PANTRY_VIEWS.includes(currentView)) navigate('pantry');
   else navigate('today');
 });
 menuBtn.addEventListener('click', showMenu);
@@ -54,6 +62,10 @@ function navigate(view, arg) {
   if (view === 'review') loadReview(arg);
   if (view === 'history') loadHistory();
   if (view === 'meal') loadMeal(arg);
+  if (view === 'pantry') loadPantry();
+  if (view === 'pantry-new') wirePantryNew();
+  if (view === 'pantry-review') loadPantryReview(arg);
+  if (view === 'pantry-item') loadPantryItem(arg);
 }
 
 // --- API helper -----------------------------------------------------------
@@ -396,6 +408,8 @@ function renderReviewForm(container, stagingId, data) {
       <button type="button" class="add-row-btn" id="add-item">+ Add item</button>
     </div>
 
+    ${proposedPantrySectionHtml(data.proposed_pantry_items)}
+
     <div class="card">
       <label class="field-label">Meal type
         <select id="meal-type">${mealTypeOptions(result.meal_type)}</select>
@@ -426,10 +440,59 @@ function renderReviewForm(container, stagingId, data) {
 
   wireNutrientEditor(container);
   wireItemsEditor(container.querySelector('#items-editor'), container.querySelector('#add-item'));
+  wireProposedPantry(container);
   wireRerun(stagingId);
 
   document.getElementById('cancel-review').addEventListener('click', () => cancelIntake(stagingId));
   document.getElementById('confirm-review').addEventListener('click', () => confirmReview(stagingId));
+}
+
+// The "remember this product" cards (FR-8b): any new pantry item the agent
+// proposed from a label in this meal, shown as editable, skippable cards.
+// Written to the pantry only when the meal is confirmed (FR-23a).
+function proposedPantrySectionHtml(proposals) {
+  if (!Array.isArray(proposals) || !proposals.length) return '';
+  const cards = proposals.map((p, i) => `
+    <div class="pantry-card" data-proposal="${i}" data-existing-id="${escapeAttr(p.existing_item_id || '')}" data-media='${escapeAttr(JSON.stringify(p.media_refs || []))}'>
+      <label class="pantry-card-toggle">
+        <input type="checkbox" data-pf="accept" checked>
+        <span>${p.existing_item_id ? 'Update' : 'Remember'} <strong>${escapeHtml(p.name)}</strong>${p.brand ? ` <span class="muted">${escapeHtml(p.brand)}</span>` : ''} in your pantry</span>
+      </label>
+      <div class="pantry-card-fields">${pantryItemFieldsHtml(p)}</div>
+    </div>`).join('');
+  return `
+    <div class="card">
+      <p class="section-title">Add to pantry</p>
+      <p class="muted" style="margin:0 0 0.6rem;">A nutrition label was spotted for ${proposals.length === 1 ? 'a product' : 'some products'} not in your pantry. Saved with the meal, ${proposals.length === 1 ? 'it becomes' : 'they become'} a known item — computed, not estimated, next time.</p>
+      ${cards}
+    </div>`;
+}
+
+function wireProposedPantry(container) {
+  container.querySelectorAll('.pantry-card').forEach((card) => {
+    const accept = card.querySelector('[data-pf="accept"]');
+    const fields = card.querySelector('.pantry-card-fields');
+    const sync = () => { fields.style.display = accept.checked ? '' : 'none'; };
+    accept.addEventListener('change', sync);
+    sync();
+  });
+}
+
+// Collects the pantry items the user kept checked, each merged with its
+// preserved existing_item_id / media_refs, for the confirm payload.
+function readAcceptedPantryItems() {
+  const out = [];
+  document.querySelectorAll('.pantry-card').forEach((card) => {
+    const accept = card.querySelector('[data-pf="accept"]');
+    if (!accept || !accept.checked) return;
+    const item = readPantryItemFields(card);
+    if (!item.name) return;
+    const existing = card.dataset.existingId;
+    if (existing) item.existing_item_id = existing;
+    try { item.media_refs = JSON.parse(card.dataset.media || '[]'); } catch (e) { item.media_refs = []; }
+    out.push(item);
+  });
+  return out;
 }
 
 function wireRerun(stagingId) {
@@ -470,7 +533,8 @@ async function confirmReview(stagingId) {
     },
     confidence: currentConfidence,
     confidence_note: currentConfidenceNote,
-    model_used: currentModelUsed
+    model_used: currentModelUsed,
+    pantry_items: readAcceptedPantryItems()
   };
   try {
     const res = await api(`/api/intake/${stagingId}/confirm`, {
@@ -478,6 +542,10 @@ async function confirmReview(stagingId) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
+    if (res.pantry_added && res.pantry_added.length) {
+      const names = res.pantry_added.map((p) => p.brand ? `${p.name} (${p.brand})` : p.name);
+      await showMessage(`${res.pantry_added.some((p) => p.updated) ? 'Updated' : 'Added'} in your pantry: ${names.join(', ')}.`);
+    }
     navigate('today', res.date);
   } catch (err) {
     btn.disabled = false;
@@ -565,9 +633,25 @@ function itemsEditorHtml(items) {
   return list.map(itemRowHtml).join('');
 }
 
+// Human labels for an item's origin (FR-5) — which numbers are facts vs guesses.
+const ORIGIN_LABELS = {
+  pantry: 'Pantry',
+  label: 'Label',
+  'user-stated': 'You stated',
+  estimate: 'Estimate'
+};
+
+function originBadgeHtml(origin, pantryName) {
+  const o = ORIGIN_LABELS[origin] ? origin : 'estimate';
+  const text = o === 'pantry' && pantryName ? `Pantry · ${pantryName}` : ORIGIN_LABELS[o];
+  return `<span class="origin-badge origin-${o}">${escapeHtml(text)}</span>`;
+}
+
 function itemRowHtml(item) {
+  const origin = ORIGIN_LABELS[item.origin] ? item.origin : 'estimate';
   return `
-    <div class="item-edit">
+    <div class="item-edit" data-origin="${origin}" data-pantry-id="${escapeAttr(item.pantry_item_id || '')}" data-pantry-name="${escapeAttr(item.pantry_name || '')}">
+      ${originBadgeHtml(origin, item.pantry_name)}
       <input type="text" data-item-field="name" value="${escapeAttr(item.name || '')}" placeholder="Item">
       <input type="text" data-item-field="amount" value="${escapeAttr(item.amount || '')}" placeholder="Amount">
       <button type="button" class="remove-btn" data-remove-item>&times;</button>
@@ -593,7 +677,18 @@ function readItemsFromDom() {
   document.querySelectorAll('.item-edit').forEach((row) => {
     const name = row.querySelector('[data-item-field="name"]').value.trim();
     const amount = row.querySelector('[data-item-field="amount"]').value.trim();
-    if (name) items.push({ name, amount });
+    if (!name) return;
+    // Origin/pantry reference round-trip so a saved meal keeps its provenance
+    // and pantry hits stay traceable (FR-8a, FR-29). Editing the name/amount of
+    // a pantry item does not re-resolve it — the resolved numbers already live
+    // in the meal totals.
+    const origin = row.dataset.origin || 'estimate';
+    const item = { name, amount, origin };
+    if (origin === 'pantry' && row.dataset.pantryId) {
+      item.pantry_item_id = row.dataset.pantryId;
+      item.pantry_name = row.dataset.pantryName || '';
+    }
+    items.push(item);
   });
   return items;
 }
@@ -709,7 +804,8 @@ function nutrientDetailRow(n, data) {
 }
 
 function itemDetailHtml(item) {
-  return `<div class="detail-item"><strong>${escapeHtml(item.name)}</strong>${item.amount ? ` — ${escapeHtml(item.amount)}` : ''}${item.source ? `<div class="src">${escapeHtml(item.source)}</div>` : ''}</div>`;
+  const badge = item.origin ? ` ${originBadgeHtml(item.origin, item.pantry_name)}` : '';
+  return `<div class="detail-item"><strong>${escapeHtml(item.name)}</strong>${item.amount ? ` — ${escapeHtml(item.amount)}` : ''}${badge}${item.source ? `<div class="src">${escapeHtml(item.source)}</div>` : ''}</div>`;
 }
 
 function renderMealEdit(container, meal) {
@@ -767,6 +863,388 @@ function renderMealEdit(container, meal) {
   });
 }
 
+// --- Pantry: shared item editor -------------------------------------------
+// Renders/reads the editable fields of a pantry item (name, brand, aliases,
+// per-100 basis, the five nutrients, optional serving/package size). Shared by
+// the meal proposal cards, the New Item review, and the pantry edit screen.
+
+function unitOptions(selected, units) {
+  return units.map((u) => `<option value="${u}"${u === selected ? ' selected' : ''}>${u}</option>`).join('');
+}
+
+function pantryItemFieldsHtml(item) {
+  const n = item.nutrition || {};
+  const basis = item.basis || { amount: 100, unit: 'g' };
+  const serving = item.serving_size || {};
+  const pkg = item.package_size || {};
+  const nutrientRows = NUTRIENTS.map((nu) => {
+    const v = n[nu.key] || {};
+    return `
+      <div class="pf-nutrient" data-pf-nutrient="${nu.key}">
+        <span class="n-label">${nu.label} <span class="muted">${nu.unit}</span></span>
+        <input type="number" inputmode="decimal" step="any" data-pf="nutrient" value="${v.value != null ? v.value : ''}" placeholder="${nu.key === 'fiber_g' ? '—' : '0'}">
+      </div>`;
+  }).join('');
+  return `
+    <label class="field-label">Name<input type="text" data-pf="name" value="${escapeAttr(item.name || '')}" placeholder="e.g. almond milk, unsweetened"></label>
+    <label class="field-label" style="margin-top:0.6rem;">Brand<input type="text" data-pf="brand" value="${escapeAttr(item.brand || '')}" placeholder="optional"></label>
+    <label class="field-label" style="margin-top:0.6rem;">Aliases <span class="muted">— comma separated</span><input type="text" data-pf="aliases" value="${escapeAttr((item.aliases || []).join(', '))}" placeholder="almond milk, the alpro one"></label>
+    <div class="pf-basis-row">
+      <span class="field-label" style="margin:0;">Values per</span>
+      <input type="number" inputmode="decimal" step="any" data-pf="basis-amount" value="${basis.amount != null ? basis.amount : 100}">
+      <select data-pf="basis-unit">${unitOptions(basis.unit || 'g', ['g', 'ml'])}</select>
+    </div>
+    <div class="pf-nutrients">${nutrientRows}</div>
+    <div class="pf-size-row">
+      <span class="field-label" style="margin:0;">Serving</span>
+      <input type="number" inputmode="decimal" step="any" data-pf="serving-amount" value="${serving.amount != null ? serving.amount : ''}" placeholder="—">
+      <select data-pf="serving-unit">${unitOptions(serving.unit || basis.unit || 'g', ['g', 'ml'])}</select>
+    </div>
+    <div class="pf-size-row">
+      <span class="field-label" style="margin:0;">Package</span>
+      <input type="number" inputmode="decimal" step="any" data-pf="package-amount" value="${pkg.amount != null ? pkg.amount : ''}" placeholder="—">
+      <select data-pf="package-unit">${unitOptions(pkg.unit || basis.unit || 'g', ['g', 'ml'])}</select>
+    </div>`;
+}
+
+function readPantryItemFields(scope) {
+  const get = (sel) => { const el = scope.querySelector(`[data-pf="${sel}"]`); return el ? el.value : ''; };
+  const num = (sel) => { const v = get(sel).trim(); return v === '' ? null : Number(v); };
+
+  const nutrition = {};
+  scope.querySelectorAll('[data-pf-nutrient]').forEach((row) => {
+    const key = row.dataset.pfNutrient;
+    const raw = row.querySelector('[data-pf="nutrient"]').value.trim();
+    nutrition[key] = { value: raw === '' ? null : Number(raw) };
+  });
+
+  const sizeOrNull = (amountSel, unitSel) => {
+    const a = num(amountSel);
+    return a == null ? null : { amount: a, unit: get(unitSel) };
+  };
+
+  return {
+    name: get('name').trim(),
+    brand: get('brand').trim(),
+    aliases: get('aliases').split(',').map((a) => a.trim()).filter(Boolean),
+    basis: { amount: num('basis-amount') != null ? num('basis-amount') : 100, unit: get('basis-unit') },
+    nutrition,
+    serving_size: sizeOrNull('serving-amount', 'serving-unit'),
+    package_size: sizeOrNull('package-amount', 'package-unit'),
+    source: 'label-photo'
+  };
+}
+
+// --- Pantry: list ---------------------------------------------------------
+
+async function loadPantry() {
+  const container = document.getElementById('pantry-content');
+  container.innerHTML = '<p class="empty-state">Loading…</p>';
+  let data;
+  try {
+    data = await api('/api/pantry');
+  } catch (err) {
+    if (err.status === 401) return;
+    container.innerHTML = `<p class="empty-state">Could not load the pantry: ${escapeHtml(err.message)}</p>`;
+    return;
+  }
+  renderPantryList(container, data.items, '');
+}
+
+function renderPantryList(container, items, query) {
+  const listHtml = items.length
+    ? `<div class="card" style="padding:0.25rem 1.25rem;">${items.map(pantryRowHtml).join('')}</div>`
+    : (query
+        ? `<p class="empty-state">No items match “${escapeHtml(query)}”.</p>`
+        : `<p class="empty-state">Your pantry is empty.<br>Tap <strong>+ New Item</strong> after shopping, or it fills itself as you log meals with nutrition labels.</p>`);
+
+  container.innerHTML = `
+    <div class="fab-row" style="margin-top:0;">
+      <button class="primary-btn" id="new-item-btn">+ New Item</button>
+    </div>
+    <input type="search" id="pantry-search" class="pantry-search" placeholder="Search name, brand, alias…" value="${escapeAttr(query)}">
+    ${listHtml}
+  `;
+
+  document.getElementById('new-item-btn').addEventListener('click', () => navigate('pantry-new'));
+  container.querySelectorAll('[data-item-id]').forEach((row) => {
+    row.addEventListener('click', () => navigate('pantry-item', row.dataset.itemId));
+  });
+
+  const search = document.getElementById('pantry-search');
+  let timer = null;
+  search.addEventListener('input', () => {
+    clearTimeout(timer);
+    const q = search.value.trim();
+    timer = setTimeout(async () => {
+      try {
+        const data = await api(`/api/pantry?q=${encodeURIComponent(q)}`);
+        if (currentView !== 'pantry') return;
+        renderPantryList(container, data.items, q);
+        document.getElementById('pantry-search').focus();
+      } catch (err) { /* keep the current list on a transient failure */ }
+    }, 200);
+  });
+}
+
+function pantryRowHtml(item) {
+  const cal = item.nutrition && item.nutrition.calories ? formatNum(item.nutrition.calories.value) : '—';
+  const per = `per ${item.basis ? item.basis.amount + ' ' + item.basis.unit : '100 g'}`;
+  const sub = [item.brand, `${cal} kcal ${per}`].filter(Boolean).join(' · ');
+  return `
+    <div class="meal-row" data-item-id="${escapeAttr(item.item_id)}">
+      <div class="meal-thumb placeholder">&#127873;</div>
+      <div class="meal-row-main">
+        <div class="meal-title">${escapeHtml(item.name)}</div>
+        <div class="meal-sub">${escapeHtml(sub)}</div>
+      </div>
+      <div class="meal-row-kcal"><span class="unit">${escapeHtml(item.basis ? item.basis.unit : '')}</span></div>
+    </div>`;
+}
+
+// --- Pantry: item detail & edit -------------------------------------------
+
+async function loadPantryItem(id) {
+  const container = document.getElementById('pantry-item-content');
+  container.innerHTML = '<p class="empty-state">Loading…</p>';
+  let item;
+  try {
+    item = await api(`/api/pantry/${id}`);
+  } catch (err) {
+    if (err.status === 401) return;
+    container.innerHTML = `<p class="empty-state">${escapeHtml(err.message)}</p>`;
+    return;
+  }
+  renderPantryItemDetail(container, item);
+}
+
+function renderPantryItemDetail(container, item) {
+  const photos = (item.media_refs || []).filter((r) => /\.(jpg|jpeg|png|webp|gif|heic|heif)$/i.test(r));
+  const photosHtml = photos.length
+    ? `<div class="detail-photos">${photos.map((p) => `<img class="${photos.length > 1 ? 'multi' : ''}" src="/api/pantry/${item.item_id}/media/${p}" alt="">`).join('')}</div>`
+    : '';
+  const basisLabel = `per ${item.basis.amount} ${item.basis.unit}`;
+  const sizeLine = [
+    item.serving_size ? `serving ${item.serving_size.amount} ${item.serving_size.unit}` : '',
+    item.package_size ? `package ${item.package_size.amount} ${item.package_size.unit}` : ''
+  ].filter(Boolean).join(' · ');
+
+  container.innerHTML = `
+    ${photosHtml}
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.4rem;">
+        <h2 style="margin:0;font-size:1.2rem;">${escapeHtml(item.name)}</h2>
+        ${item.brand ? `<span class="pill">${escapeHtml(item.brand)}</span>` : ''}
+      </div>
+      ${(item.aliases && item.aliases.length) ? `<p class="muted" style="margin:0;">aka ${escapeHtml(item.aliases.join(', '))}</p>` : ''}
+    </div>
+
+    <div class="card">
+      <p class="section-title">Nutrition <span class="muted">${escapeHtml(basisLabel)}</span></p>
+      ${NUTRIENTS.map((n) => nutrientDetailRow(n, item.nutrition[n.key])).join('')}
+      ${sizeLine ? `<p class="muted" style="margin:0.6rem 0 0;">${escapeHtml(sizeLine)}</p>` : ''}
+    </div>
+
+    <div class="card muted" style="font-size:0.75rem;">
+      Source: ${escapeHtml(item.source || 'n/a')} · added ${escapeHtml(item.added_via || 'n/a')}${item.confidence != null ? ` · ${Math.round(item.confidence * 100)}% confident` : ''}<br>
+      Verified ${escapeHtml(item.last_verified || 'n/a')} · model ${escapeHtml(item.model_used || 'n/a')}
+    </div>
+
+    <div class="action-row">
+      <button class="danger-btn" id="delete-item">Delete</button>
+      <button class="secondary-btn" id="edit-item">Edit</button>
+    </div>
+  `;
+
+  document.getElementById('edit-item').addEventListener('click', () => renderPantryItemEdit(container, item));
+  document.getElementById('delete-item').addEventListener('click', async () => {
+    if (!(await showConfirm('Delete this pantry item? Meals that already used it keep their saved numbers.'))) return;
+    try {
+      await api(`/api/pantry/${item.item_id}`, { method: 'DELETE' });
+      navigate('pantry');
+    } catch (err) {
+      if (err.status !== 401) await showMessage(`Could not delete: ${err.message}`);
+    }
+  });
+}
+
+function renderPantryItemEdit(container, item) {
+  container.innerHTML = `
+    <div class="card">
+      <p class="section-title">Edit item</p>
+      <div id="pantry-edit-fields">${pantryItemFieldsHtml(item)}</div>
+    </div>
+    <div class="action-row">
+      <button class="secondary-btn" id="cancel-item-edit">Cancel</button>
+      <button class="primary-btn" id="save-item-edit">Save</button>
+    </div>
+  `;
+  document.getElementById('cancel-item-edit').addEventListener('click', () => renderPantryItemDetail(container, item));
+  document.getElementById('save-item-edit').addEventListener('click', async () => {
+    const btn = document.getElementById('save-item-edit');
+    const payload = readPantryItemFields(document.getElementById('pantry-edit-fields'));
+    payload.source = item.source || 'label-photo';
+    if (!payload.name) { await showMessage('An item needs a name.'); return; }
+    btn.disabled = true;
+    try {
+      const updated = await api(`/api/pantry/${item.item_id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      renderPantryItemDetail(container, updated);
+    } catch (err) {
+      btn.disabled = false;
+      if (err.status !== 401) await showMessage(`Could not save: ${err.message}`);
+    }
+  });
+}
+
+// --- Pantry: New Item flow ------------------------------------------------
+
+function wirePantryNew() {
+  intakeState = { photos: [], audio: null };
+  const form = document.getElementById('pantry-new-form');
+  const photoInput = document.getElementById('photo-input');
+  const errorEl = document.getElementById('intake-error');
+
+  photoInput.addEventListener('change', () => {
+    for (const file of photoInput.files) {
+      if (intakeState.photos.length >= 10) break;
+      intakeState.photos.push(file);
+    }
+    photoInput.value = '';
+    renderPhotoPreviews();
+  });
+
+  renderPhotoPreviews();
+  wireAudio();
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    errorEl.hidden = true;
+    const text = document.getElementById('intake-text').value.trim();
+    if (!intakeState.photos.length && !intakeState.audio && !text) {
+      errorEl.textContent = 'Add at least a label photo, an audio note, or some text.';
+      errorEl.hidden = false;
+      return;
+    }
+    const submitBtn = document.getElementById('intake-submit');
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Uploading…';
+
+    const fd = new FormData();
+    intakeState.photos.forEach((p) => fd.append('photos', p, p.name || 'photo.jpg'));
+    if (intakeState.audio) fd.append('audio', intakeState.audio, 'audio.webm');
+    if (text) fd.append('text', text);
+
+    try {
+      const res = await api('/api/pantry/intake', { method: 'POST', body: fd });
+      navigate('pantry-review', res.staging_id);
+    } catch (err) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Extract items';
+      if (err.status !== 401) { errorEl.textContent = err.message; errorEl.hidden = false; }
+    }
+  });
+}
+
+async function loadPantryReview(stagingId) {
+  const container = document.getElementById('pantry-review-content');
+  container.innerHTML = `<div class="pending-box"><div class="spinner"></div><p><strong>Reading the labels…</strong></p><p class="muted">The agent is extracting each product's nutrition facts. This page updates automatically.</p><div class="action-row single"><button class="danger-btn" id="cancel-analyzing">Cancel</button></div></div>`;
+  const cancelBtn = document.getElementById('cancel-analyzing');
+  if (cancelBtn) cancelBtn.addEventListener('click', () => cancelPantryIntake(stagingId));
+
+  let data;
+  try {
+    data = await api(`/api/intake/${stagingId}`);
+  } catch (err) {
+    if (err.status === 401) return;
+    container.innerHTML = `<p class="empty-state">${escapeHtml(err.message)}</p><div class="action-row single"><button class="secondary-btn" id="back-pantry">Back to pantry</button></div>`;
+    const b = document.getElementById('back-pantry');
+    if (b) b.addEventListener('click', () => navigate('pantry'));
+    return;
+  }
+
+  if (data.status === 'analyzing') {
+    pollTimer = setTimeout(() => { if (currentView === 'pantry-review') loadPantryReview(stagingId); }, 2500);
+    return;
+  }
+  if (data.status === 'error') {
+    container.innerHTML = `
+      <div class="card pending-box">
+        <p><strong>Couldn't extract an item.</strong></p>
+        <p class="muted">${escapeHtml(data.message || 'Unknown error.')}</p>
+        <div class="action-row">
+          <button class="danger-btn" id="discard-failed">Discard</button>
+          <button class="secondary-btn" id="retry-failed">Retry</button>
+        </div>
+      </div>`;
+    document.getElementById('discard-failed').addEventListener('click', () => cancelPantryIntake(stagingId));
+    document.getElementById('retry-failed').addEventListener('click', async () => {
+      try {
+        await api(`/api/intake/${stagingId}/rerun`, { method: 'POST', body: new FormData() });
+        navigate('pantry-review', stagingId);
+      } catch (err) {
+        if (err.status !== 401) await showMessage(`Could not retry: ${err.message}`);
+      }
+    });
+    return;
+  }
+
+  renderPantryReviewForm(container, stagingId, data);
+}
+
+function renderPantryReviewForm(container, stagingId, data) {
+  const items = data.items || [];
+  const cards = items.map((it, i) => `
+    <div class="card pantry-card" data-proposal="${i}" data-existing-id="${escapeAttr(it.existing_item_id || '')}" data-media='${escapeAttr(JSON.stringify(it.media_refs || []))}'>
+      <label class="pantry-card-toggle">
+        <input type="checkbox" data-pf="accept" checked>
+        <span>${it.existing_item_id ? 'Update existing item' : 'Save this item'}</span>
+      </label>
+      <div class="pantry-card-fields">${pantryItemFieldsHtml(it)}</div>
+    </div>`).join('');
+
+  container.innerHTML = `
+    <p class="muted" style="margin:0 0 0.8rem;">${items.length} item${items.length === 1 ? '' : 's'} read from your labels. Correct anything off, add aliases, then save.</p>
+    ${cards}
+    <div class="action-row">
+      <button class="danger-btn" id="cancel-review">Cancel</button>
+      <button class="primary-btn" id="confirm-review">Save to pantry</button>
+    </div>
+  `;
+  wireProposedPantry(container);
+  document.getElementById('cancel-review').addEventListener('click', () => cancelPantryIntake(stagingId));
+  document.getElementById('confirm-review').addEventListener('click', async () => {
+    const accepted = readAcceptedPantryItems();
+    if (!accepted.length) { await showMessage('Tick at least one item to save, or cancel.'); return; }
+    const btn = document.getElementById('confirm-review');
+    btn.disabled = true;
+    try {
+      const res = await api(`/api/pantry/intake/${stagingId}/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: accepted })
+      });
+      const names = (res.saved || []).map((p) => p.brand ? `${p.name} (${p.brand})` : p.name);
+      if (names.length) await showMessage(`Saved to your pantry: ${names.join(', ')}.`);
+      navigate('pantry');
+    } catch (err) {
+      btn.disabled = false;
+      if (err.status !== 401) await showMessage(`Could not save: ${err.message}`);
+    }
+  });
+}
+
+async function cancelPantryIntake(stagingId) {
+  if (!(await showConfirm('Discard this? Nothing will be saved.'))) return;
+  try {
+    await api(`/api/intake/${stagingId}`, { method: 'DELETE' });
+  } catch (err) { /* best effort; staging expires anyway */ }
+  navigate('pantry');
+}
+
 // --- Menu -----------------------------------------------------------------
 
 function showMenu() {
@@ -777,6 +1255,7 @@ function showMenu() {
   sheet.innerHTML = `
     <button data-act="today">Today</button>
     <button data-act="history">History</button>
+    <button data-act="pantry">Pantry</button>
     <button data-act="export">Export CSV</button>
     <button data-act="logout">Log out</button>`;
   document.body.appendChild(sheet);
@@ -793,6 +1272,7 @@ function showMenu() {
     document.removeEventListener('click', close);
     if (act === 'today') navigate('today');
     if (act === 'history') navigate('history');
+    if (act === 'pantry') navigate('pantry');
     if (act === 'export') window.location.href = '/api/export/csv';
     if (act === 'logout') {
       try { await api('/api/logout', { method: 'POST' }); } catch (err) { /* ignore */ }

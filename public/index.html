@@ -77,6 +77,46 @@
   <div id="meal-content"></div>
 </template>
 
+<template id="tpl-pantry">
+  <div id="pantry-content"></div>
+</template>
+
+<template id="tpl-pantry-new">
+  <form id="pantry-new-form" class="form">
+    <div class="card">
+      <div class="field-label">Nutrition labels <span class="muted">— photograph the labels of what you bought; several at once is fine</span></div>
+      <div id="photo-previews" class="photo-previews"></div>
+      <label class="upload-btn">
+        <span>&#128247; Add label photos</span>
+        <input type="file" id="photo-input" accept="image/*" capture="environment" multiple hidden>
+      </label>
+    </div>
+
+    <div class="card">
+      <div class="field-label">Audio note <span class="muted">— up to 15 seconds, optional</span></div>
+      <div id="audio-area" class="audio-area"></div>
+    </div>
+
+    <div class="card">
+      <label class="field-label">
+        Text <span class="muted">— or type the values / product names</span>
+        <textarea id="intake-text" rows="3" placeholder="e.g. Alpro almond milk, 13 kcal per 100 ml, 0.4g protein…"></textarea>
+      </label>
+    </div>
+
+    <p id="intake-error" class="login-error" hidden></p>
+    <button type="submit" class="primary-btn" id="intake-submit">Extract items</button>
+  </form>
+</template>
+
+<template id="tpl-pantry-review">
+  <div id="pantry-review-content"></div>
+</template>
+
+<template id="tpl-pantry-item">
+  <div id="pantry-item-content"></div>
+</template>
+
 <script src="app.js"></script>
 </body>
 </html>

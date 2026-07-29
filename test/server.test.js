@@ -22,6 +22,16 @@ const {
   csvColumns,
   mealToCsvRow,
   buildHistoryCsv,
+  slugify,
+  makeItemId,
+  cleanAmountUnit,
+  cleanPantryNutrient,
+  cleanAliases,
+  validateAndCleanPantryItem,
+  buildPantryIndex,
+  findMatchingPantryItem,
+  resolvePantryContribution,
+  addNutritionInto,
   NUTRIENTS
 } = require('../server.js');
 
@@ -79,7 +89,23 @@ test('cleanItems keeps named items, drops blanks, caps count', () => {
     'not an object'
   ]);
   assert.equal(items.length, 1);
-  assert.deepEqual(items[0], { name: 'rice', amount: '200 g', source: 'photo estimate' });
+  assert.deepEqual(items[0], {
+    name: 'rice', amount: '200 g', source: 'photo estimate',
+    origin: 'estimate', pantry_item_id: null, pantry_name: ''
+  });
+});
+
+test('cleanItems keeps a valid pantry reference and drops a forged one', () => {
+  const items = cleanItems([
+    { name: 'almond milk', amount: '50 ml', origin: 'pantry', pantry_item_id: 'almond-milk__7f3a91', matched_name: 'Almond milk — Alpro' },
+    { name: 'mystery', origin: 'pantry', pantry_item_id: 'not a real id' }
+  ]);
+  assert.equal(items[0].origin, 'pantry');
+  assert.equal(items[0].pantry_item_id, 'almond-milk__7f3a91');
+  assert.equal(items[0].pantry_name, 'Almond milk — Alpro');
+  // pantry origin without a well-formed id falls back to estimate
+  assert.equal(items[1].origin, 'estimate');
+  assert.equal(items[1].pantry_item_id, null);
 });
 
 test('cleanLocation rounds coords and keeps null when absent', () => {
@@ -274,4 +300,175 @@ test('buildHistoryCsv emits a header plus one row per meal, oldest first', () =>
 test('buildHistoryCsv on no meals is just the header', () => {
   const csv = buildHistoryCsv([]);
   assert.equal(csv.trim(), csvColumns().join(','));
+});
+
+// --- Pantry: ids & slugs --------------------------------------------------
+
+test('slugify lowercases, strips accents, and collapses to hyphens', () => {
+  assert.equal(slugify('Almond Milk, Unsweetened'), 'almond-milk-unsweetened');
+  assert.equal(slugify('  Café Latté!!  '), 'cafe-latte');
+  assert.equal(slugify('***'), '');
+});
+
+test('makeItemId is a slug plus a 6-hex suffix and matches the id pattern', () => {
+  const id = makeItemId('almond milk', 'Alpro');
+  assert.match(id, /^[a-z0-9-]+__[0-9a-f]{6}$/);
+  assert.ok(id.startsWith('almond-milk-alpro__'));
+  assert.equal(makeItemId('', '').startsWith('item__'), true);
+});
+
+// --- Pantry: amount/unit, nutrient, aliases -------------------------------
+
+test('cleanAmountUnit validates amount and constrains the unit', () => {
+  assert.deepEqual(cleanAmountUnit({ amount: 100, unit: 'ml' }, ['g', 'ml'], 'g'), { amount: 100, unit: 'ml' });
+  assert.deepEqual(cleanAmountUnit({ amount: 250, unit: 'oz' }, ['g', 'ml'], 'g'), { amount: 250, unit: 'g' });
+  assert.equal(cleanAmountUnit({ amount: 0 }, ['g', 'ml'], 'g'), null);
+  assert.equal(cleanAmountUnit(null, ['g', 'ml'], 'g'), null);
+});
+
+test('cleanPantryNutrient requires a value for macros but allows null fiber', () => {
+  const cal = NUTRIENTS.find((n) => n.key === 'calories');
+  const fiber = NUTRIENTS.find((n) => n.key === 'fiber_g');
+  assert.deepEqual(cleanPantryNutrient({ value: '13.005' }, cal), { nutrient: { value: 13.01, unit: 'kcal' } });
+  assert.ok(cleanPantryNutrient({ value: '' }, cal).error);
+  assert.deepEqual(cleanPantryNutrient({ value: null }, fiber), { nutrient: { value: null, unit: 'g' } });
+});
+
+test('cleanAliases trims, de-dupes case-insensitively, and drops blanks', () => {
+  assert.deepEqual(cleanAliases(['Almond milk', 'almond milk', '  ', 'Alpro']), ['Almond milk', 'Alpro']);
+  assert.deepEqual(cleanAliases('not an array'), []);
+});
+
+// --- Pantry: full item validation -----------------------------------------
+
+function samplePantryInput() {
+  return {
+    name: 'almond milk, unsweetened',
+    brand: 'Alpro',
+    aliases: ['almond milk', 'the alpro one'],
+    basis: { amount: 100, unit: 'ml' },
+    nutrition: {
+      calories: { value: 13 }, protein_g: { value: 0.4 },
+      fat_g: { value: 1.1 }, carbs_g: { value: 0.0 }, fiber_g: { value: 0.4 }
+    },
+    serving_size: { amount: 250, unit: 'ml' },
+    package_size: { amount: 1000, unit: 'ml' },
+    source: 'label-photo',
+    confidence: 0.95,
+    model_used: 'opus'
+  };
+}
+
+test('validateAndCleanPantryItem accepts a well-formed item and whitelists it', () => {
+  const { content, error } = validateAndCleanPantryItem(samplePantryInput());
+  assert.equal(error, undefined);
+  assert.equal(content.name, 'almond milk, unsweetened');
+  assert.equal(content.basis.unit, 'ml');
+  assert.equal(content.nutrition.calories.value, 13);
+  assert.equal(content.nutrition.calories.unit, 'kcal');
+  assert.equal(content.source, 'label-photo');
+});
+
+test('validateAndCleanPantryItem drops forged/server-owned fields', () => {
+  const input = { ...samplePantryInput(), item_id: 'x', created_at: 'y', added_via: 'meal-auto', last_used_at: 'z' };
+  const { content } = validateAndCleanPantryItem(input);
+  assert.equal(content.item_id, undefined);
+  assert.equal(content.created_at, undefined);
+  assert.equal(content.added_via, undefined);
+  assert.equal(content.last_used_at, undefined);
+});
+
+test('validateAndCleanPantryItem requires a name, basis, and macro values', () => {
+  assert.ok(validateAndCleanPantryItem(null).error);
+  const noName = samplePantryInput(); noName.name = '   ';
+  assert.ok(validateAndCleanPantryItem(noName).error);
+  const noBasis = samplePantryInput(); delete noBasis.basis;
+  assert.ok(validateAndCleanPantryItem(noBasis).error);
+  const noCal = samplePantryInput(); delete noCal.nutrition.calories;
+  assert.ok(validateAndCleanPantryItem(noCal).error);
+});
+
+test('validateAndCleanPantryItem falls back to label-photo for an unknown source', () => {
+  const input = samplePantryInput(); input.source = 'made-up';
+  assert.equal(validateAndCleanPantryItem(input).content.source, 'label-photo');
+});
+
+// --- Pantry: index & matching ---------------------------------------------
+
+test('buildPantryIndex exposes only match fields, never the numbers', () => {
+  const idx = buildPantryIndex([{
+    item_id: 'a__000000', name: 'x', brand: 'b', aliases: ['y'], basis: { amount: 100, unit: 'g' },
+    nutrition: { calories: { value: 500 } }
+  }]);
+  assert.deepEqual(idx[0], { id: 'a__000000', name: 'x', brand: 'b', aliases: ['y'], basis: { amount: 100, unit: 'g' } });
+  assert.equal(idx[0].nutrition, undefined);
+});
+
+test('findMatchingPantryItem matches on name+brand case-insensitively', () => {
+  const items = [
+    { item_id: 'a__000000', name: 'Almond Milk', brand: 'Alpro' },
+    { item_id: 'b__000000', name: 'Oat Milk', brand: '' }
+  ];
+  assert.equal(findMatchingPantryItem('almond milk', 'ALPRO', items).item_id, 'a__000000');
+  assert.equal(findMatchingPantryItem('oat milk', '', items).item_id, 'b__000000');
+  assert.equal(findMatchingPantryItem('almond milk', 'other', items), null);
+});
+
+// --- Pantry: server-side arithmetic (FR-22a, FR-27) -----------------------
+
+const ALMOND = {
+  item_id: 'almond-milk__7f3a91',
+  basis: { amount: 100, unit: 'ml' },
+  nutrition: {
+    calories: { value: 13 }, protein_g: { value: 0.4 },
+    fat_g: { value: 1.1 }, carbs_g: { value: 0.0 }, fiber_g: { value: null }
+  },
+  serving_size: { amount: 250, unit: 'ml' },
+  package_size: { amount: 1000, unit: 'ml' }
+};
+
+test('resolvePantryContribution scales stored per-100 values by a ml amount', () => {
+  const r = resolvePantryContribution(ALMOND, { amount: 50, unit: 'ml' });
+  assert.equal(r.origin, 'pantry');
+  assert.equal(r.estimated, false);
+  assert.equal(r.nutrition.calories.value, 6.5); // 13 * 50/100
+  assert.equal(r.nutrition.fat_g.value, 0.55);
+  assert.equal(r.nutrition.fiber_g.value, null); // null stays null, never guessed
+});
+
+test('resolvePantryContribution resolves servings and packages', () => {
+  const serv = resolvePantryContribution(ALMOND, { amount: 2, unit: 'serving' }); // 2 * 250 ml
+  assert.equal(serv.nutrition.calories.value, 65); // 13 * 500/100
+  const pkg = resolvePantryContribution(ALMOND, { amount: 1, unit: 'package' }); // 1000 ml
+  assert.equal(pkg.nutrition.calories.value, 130);
+});
+
+test('resolvePantryContribution flags a g/ml mismatch as an estimate (FR-27)', () => {
+  const r = resolvePantryContribution(ALMOND, { amount: 50, unit: 'g' }); // basis is ml
+  assert.equal(r.estimated, true);
+  assert.equal(r.origin, 'estimate');
+  assert.ok(r.note.includes('mismatch'));
+});
+
+test('resolvePantryContribution returns null on unusable input', () => {
+  assert.equal(resolvePantryContribution(ALMOND, { amount: 0, unit: 'ml' }), null);
+  assert.equal(resolvePantryContribution(ALMOND, { amount: 5, unit: 'bogus' }), null);
+  const noServing = { ...ALMOND, serving_size: null };
+  assert.equal(resolvePantryContribution(noServing, { amount: 1, unit: 'serving' }), null);
+});
+
+test('addNutritionInto sums a contribution into a meal nutrition object', () => {
+  const nutrition = {
+    calories: { value: 200, low: 180, high: 220, unit: 'kcal' },
+    protein_g: { value: 10, low: null, high: null, unit: 'g' },
+    fat_g: { value: 5, low: null, high: null, unit: 'g' },
+    carbs_g: { value: 20, low: null, high: null, unit: 'g' },
+    fiber_g: { value: null, low: null, high: null, unit: 'g' }
+  };
+  const contribution = resolvePantryContribution(ALMOND, { amount: 100, unit: 'ml' }).nutrition;
+  addNutritionInto(nutrition, contribution);
+  assert.equal(nutrition.calories.value, 213); // 200 + 13
+  assert.equal(nutrition.calories.low, 180);   // band preserved
+  assert.equal(nutrition.fat_g.value, 6.1);    // 5 + 1.1
+  assert.equal(nutrition.fiber_g.value, null); // null + null stays null
 });
