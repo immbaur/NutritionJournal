@@ -1,0 +1,21 @@
+# Nutrition Journal site block — APPEND this to the droplet's existing
+# /etc/caddy/Caddyfile (do NOT replace the file; the other site blocks must
+# stay). Caddy serves multiple sites from one Caddyfile.
+#
+#   sudo sh -c 'cat /home/nutrition/NutritionJournal/deploy/nutrition.caddy >> /etc/caddy/Caddyfile'
+#   sudo caddy validate --config /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+#
+# Requires a DNS record for nutrition.heyimmi.com pointing at the droplet
+# (see DIGITALOCEAN.md, step 1). Caddy fetches the Let's Encrypt cert on the
+# first request; the /.well-known/acme-challenge path is exempt from
+# Cloudflare's HTTPS redirect, so HTTP-01 works even while proxied.
+#
+# request_body max_size lifts Caddy's default cap so multi-photo uploads (and
+# the server's 25 MB-per-file limit) get through the proxy.
+nutrition.heyimmi.com {
+	request_body {
+		max_size 60MB
+	}
+	reverse_proxy 127.0.0.1:3100
+}

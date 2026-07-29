@@ -1,0 +1,25 @@
+# systemd unit for the Nutrition Journal server.
+# Install: sudo cp deploy/nutrition.service /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable --now nutrition
+[Unit]
+Description=Nutrition Journal
+After=network.target
+
+[Service]
+User=nutrition
+WorkingDirectory=/home/nutrition/NutritionJournal
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=3
+
+# Secrets and settings live in /etc/nutrition.env (chmod 600), not here.
+EnvironmentFile=/etc/nutrition.env
+# Only reachable through the local reverse proxy (Caddy).
+Environment=HOST=127.0.0.1
+Environment=PORT=3100
+# server.js spawns the `claude` CLI; the native installer puts it in
+# ~/.local/bin, which systemd's default PATH does not include.
+Environment=PATH=/home/nutrition/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target

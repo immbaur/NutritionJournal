@@ -1,0 +1,17 @@
+{
+  "name": "nutrition-journal",
+  "version": "1.0.0",
+  "description": "Personal nutrition journal: log meals from photos/audio/text, agent-estimated nutrition, per-meal JSON storage",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test",
+    "export-csv": "node scripts/export-csv.js"
+  },
+  "dependencies": {
+    "chart.js": "4.4.9",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1"
+  }
+}

@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
+<title>Nutrition Journal</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <button id="back-btn" class="icon-btn" hidden>&larr;</button>
+  <h1 id="page-title">Nutrition Journal</h1>
+  <button id="menu-btn" class="icon-btn" hidden title="Menu">&#9776;</button>
+</header>
+
+<main id="app"></main>
+
+<template id="tpl-login">
+  <div class="login-landing">
+    <div class="login-hero">
+      <div class="login-logo">&#127869;</div>
+      <h2>Nutrition Journal</h2>
+      <p class="muted">Log a meal in seconds. Let the agent do the math.</p>
+    </div>
+    <form id="login-form" class="card form">
+      <label>
+        Password
+        <input type="password" name="password" autocomplete="current-password" required autofocus>
+      </label>
+      <p id="login-error" class="login-error" hidden></p>
+      <button type="submit" class="primary-btn">Sign in</button>
+    </form>
+  </div>
+</template>
+
+<template id="tpl-today">
+  <div id="today-content"></div>
+</template>
+
+<template id="tpl-intake">
+  <form id="intake-form" class="form">
+    <div class="card">
+      <div class="field-label">Photos <span class="muted">— food and/or nutrition labels, add as many as you like</span></div>
+      <div id="photo-previews" class="photo-previews"></div>
+      <label class="upload-btn">
+        <span>&#128247; Add photos</span>
+        <input type="file" id="photo-input" accept="image/*" capture="environment" multiple hidden>
+      </label>
+    </div>
+
+    <div class="card">
+      <div class="field-label">Audio note <span class="muted">— up to 15 seconds</span></div>
+      <div id="audio-area" class="audio-area"></div>
+    </div>
+
+    <div class="card">
+      <label class="field-label">
+        Text
+        <textarea id="intake-text" rows="3" placeholder="e.g. 150g grilled chicken, a cup of rice, and the sauce from the jar in the photo"></textarea>
+      </label>
+    </div>
+
+    <p id="intake-error" class="login-error" hidden></p>
+    <button type="submit" class="primary-btn" id="intake-submit">Analyze meal</button>
+  </form>
+</template>
+
+<template id="tpl-review">
+  <div id="review-content"></div>
+</template>
+
+<template id="tpl-history">
+  <div id="history-content"></div>
+</template>
+
+<template id="tpl-meal">
+  <div id="meal-content"></div>
+</template>
+
+<script src="app.js"></script>
+</body>
+</html>

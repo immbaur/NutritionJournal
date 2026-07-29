@@ -1,5 +1,10 @@
 node_modules/
-data/
-*.log
+.claude/settings.local.json
 .DS_Store
+*.log
 .env
+
+# Personal nutrition data — generated at runtime, not checked in.
+# data/.gitkeep is tracked so the directory exists on a fresh clone.
+data/*
+!data/.gitkeep
