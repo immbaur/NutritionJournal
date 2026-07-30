@@ -244,6 +244,9 @@ function wireIntake() {
     intakeState.photos.forEach((p) => fd.append('photos', p, p.name || 'photo.jpg'));
     if (intakeState.audio) fd.append('audio', intakeState.audio, 'audio.webm');
     if (text) fd.append('text', text);
+    // This device's clock decides the day and the auto meal type; adjustable in
+    // review if the meal was actually earlier.
+    fd.append('occurred_at', wallClockNow());
 
     try {
       const res = await api('/api/intake', { method: 'POST', body: fd });
@@ -411,7 +414,9 @@ function renderReviewForm(container, stagingId, data) {
     ${proposedPantrySectionHtml(data.proposed_pantry_items)}
 
     <div class="card">
-      <label class="field-label">Meal type
+      <p class="section-title">When</p>
+      ${whenFieldHtml(data.occurred_at)}
+      <label class="field-label" style="margin-top:0.75rem;">Meal type
         <select id="meal-type">${mealTypeOptions(result.meal_type)}</select>
       </label>
       <label class="field-label" style="margin-top:0.75rem;">Place (optional)
@@ -441,10 +446,11 @@ function renderReviewForm(container, stagingId, data) {
   wireNutrientEditor(container);
   wireItemsEditor(container.querySelector('#items-editor'), container.querySelector('#add-item'));
   wireProposedPantry(container);
+  wireWhenField();
   wireRerun(stagingId);
 
   document.getElementById('cancel-review').addEventListener('click', () => cancelIntake(stagingId));
-  document.getElementById('confirm-review').addEventListener('click', () => confirmReview(stagingId));
+  document.getElementById('confirm-review').addEventListener('click', () => confirmReview(stagingId, data.occurred_at));
 }
 
 // The "remember this product" cards (FR-8b): any new pantry item the agent
@@ -521,10 +527,11 @@ function wireRerun(stagingId) {
   });
 }
 
-async function confirmReview(stagingId) {
+async function confirmReview(stagingId, stagedOccurredAt) {
   const btn = document.getElementById('confirm-review');
   btn.disabled = true;
   const payload = {
+    occurred_at: readWhenFromDom(stagedOccurredAt),
     nutrition: readNutritionFromDom(),
     items: readItemsFromDom(),
     meal_type: document.getElementById('meal-type').value,
@@ -709,7 +716,9 @@ async function loadHistory() {
   container.innerHTML = '<p class="empty-state">Loading…</p>';
   let data;
   try {
-    data = await api('/api/history?days=30');
+    // `end` is this device's today — without it the server would anchor the
+    // window to its own date and could open on a day that has not started here.
+    data = await api(`/api/history?days=30&end=${todayStr()}`);
   } catch (err) {
     if (err.status === 401) return;
     container.innerHTML = `<p class="empty-state">Could not load history: ${escapeHtml(err.message)}</p>`;
@@ -827,7 +836,9 @@ function renderMealEdit(container, meal) {
       <button type="button" class="add-row-btn" id="add-item">+ Add item</button>
     </div>
     <div class="card">
-      <label class="field-label">Meal type <select id="meal-type">${mealTypeOptions(meal.meal_type)}</select></label>
+      <p class="section-title">When</p>
+      ${whenFieldHtml(meal.timestamp)}
+      <label class="field-label" style="margin-top:0.75rem;">Meal type <select id="meal-type">${mealTypeOptions(meal.meal_type)}</select></label>
       <label class="field-label" style="margin-top:0.75rem;">Place <input type="text" id="location-name" value="${escapeAttr(meal.location && meal.location.name || '')}"></label>
       <label class="field-label" style="margin-top:0.75rem;">Note <textarea id="review-note" rows="2">${escapeHtml(meal.note || '')}</textarea></label>
     </div>
@@ -843,6 +854,7 @@ function renderMealEdit(container, meal) {
     const btn = document.getElementById('save-edit');
     btn.disabled = true;
     const payload = {
+      occurred_at: readWhenFromDom(meal.timestamp),
       nutrition: readNutritionFromDom(),
       items: readItemsFromDom(),
       meal_type: document.getElementById('meal-type').value,
@@ -858,6 +870,9 @@ function renderMealEdit(container, meal) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
+      // A re-dated meal belongs to another day, so the day the back button
+      // returns to follows it rather than stranding the user on an empty one.
+      viewDate = updated.date;
       renderMealDetail(container, updated);
     } catch (err) {
       btn.disabled = false;
@@ -1356,6 +1371,87 @@ function todayStr() {
   const d = new Date();
   const pad = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+// --- Wall clock -----------------------------------------------------------
+// The browser owns *when* a meal happened. Every write sends a full local
+// timestamp with its UTC offset (`2026-07-29T19:26:57-07:00`), because the
+// server runs in UTC and would otherwise file an evening meal under tomorrow.
+
+function formatWallClock(d) {
+  const pad = (n) => String(n).padStart(2, '0');
+  const off = -d.getTimezoneOffset();
+  const abs = Math.abs(off);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+    + `T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+    + `${off >= 0 ? '+' : '-'}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+}
+
+function wallClockNow() {
+  return formatWallClock(new Date());
+}
+
+// Builds a wall clock from the date/time inputs. Going through a Date picks up
+// the offset in force on *that* day, so a date across a DST boundary is right.
+function wallClockFromInputs(dateStr, timeStr) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const [hh, mi] = timeStr.split(':').map(Number);
+  return formatWallClock(new Date(y, m - 1, d, hh, mi, 0));
+}
+
+// Splits a stored timestamp textually, so the form shows the wall clock as it
+// was recorded rather than re-rendering it in whatever zone this device is in.
+function splitWallClock(iso) {
+  const m = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})/.exec(String(iso == null ? '' : iso));
+  return m ? { date: m[1], time: `${m[2]}:${m[3]}` } : null;
+}
+
+// Mirrors the server's meal-type windows (FR-13) so re-timing an entry moves its
+// meal type with it while the user is still composing.
+const MEAL_TYPE_WINDOWS = [
+  { type: 'breakfast', start: 4, end: 11 },
+  { type: 'lunch', start: 11, end: 15 },
+  { type: 'dinner', start: 17, end: 22 }
+];
+
+function mealTypeForHour(hour) {
+  const w = MEAL_TYPE_WINDOWS.find((win) => hour >= win.start && hour < win.end);
+  return w ? w.type : 'snack';
+}
+
+// The date/time control shown in review and in a saved meal's edit form, so a
+// meal forgotten this morning — or mistimed — can be placed on the right day.
+function whenFieldHtml(iso) {
+  const when = splitWallClock(iso) || splitWallClock(wallClockNow());
+  return `
+    <div class="when-row">
+      <label class="field-label">Date<input type="date" data-when="date" value="${when.date}" max="${todayStr()}"></label>
+      <label class="field-label">Time<input type="time" data-when="time" value="${when.time}"></label>
+    </div>`;
+}
+
+// Keeps the meal type in step with the time until the user picks one themselves.
+function wireWhenField() {
+  const timeEl = document.querySelector('[data-when="time"]');
+  const typeEl = document.getElementById('meal-type');
+  if (!timeEl || !typeEl) return;
+  let typeChosenByUser = false;
+  typeEl.addEventListener('change', () => { typeChosenByUser = true; });
+  timeEl.addEventListener('change', () => {
+    if (typeChosenByUser || !timeEl.value) return;
+    typeEl.value = mealTypeForHour(Number(timeEl.value.slice(0, 2)));
+  });
+}
+
+// Reads the control back. An untouched field returns the original string
+// verbatim, so saving an unrelated edit never churns the recorded seconds.
+function readWhenFromDom(originalIso) {
+  const dateEl = document.querySelector('[data-when="date"]');
+  const timeEl = document.querySelector('[data-when="time"]');
+  if (!dateEl || !timeEl || !dateEl.value || !timeEl.value) return originalIso || wallClockNow();
+  const original = splitWallClock(originalIso);
+  if (original && original.date === dateEl.value && original.time === timeEl.value) return originalIso;
+  return wallClockFromInputs(dateEl.value, timeEl.value);
 }
 
 function shiftDate(dateStr, delta) {

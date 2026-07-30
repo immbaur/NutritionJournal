@@ -79,6 +79,8 @@ NUTRITION_PASSWORD=your-password PORT=3100 ./start.sh
 3. **Review** the estimate — per-item breakdown, totals with optional low–high
    ranges, and a confidence score. Edit any value, or add a missing label /
    the exact grams and **re-analyze**. Low confidence nudges you to do so.
+   **When** defaults to now and is editable, so a meal you forgot to log this
+   morning (or last Tuesday) still lands on the right day.
 4. **Confirm & Save** writes this meal's own folder,
    `data/meals/<entry_id>/meal.json`, alongside the raw photos/audio/`note.txt`,
    with the timestamp, date, auto-classified meal type, and location. The
@@ -86,11 +88,26 @@ NUTRITION_PASSWORD=your-password PORT=3100 ./start.sh
 5. Back on the **Today** dashboard, the new meal appears and today's totals
    update — all computed live from the JSON files.
 
+Any saved meal stays **editable**: tap it on a day's list and hit **Edit** to
+correct nutrient values, items, meal type, place, note, or its date and time.
+Editing rewrites only that one `meal.json`; totals recompute themselves.
+
 Meal type is inferred from the time of day (breakfast/lunch/dinner/snack) and
-can be overridden. Location uses the browser's Geolocation: the raw lat/long is
+can be overridden — change the time in review and the type follows until you
+pick one yourself. Location uses the browser's Geolocation: the raw lat/long is
 always stored, and a place name is reused from a nearby saved entry ("home",
 "office", …), suggested, or taken from what you said — degrading gracefully to
 no location if permission is denied.
+
+### Timezones
+
+A meal's date and time are always **your** wall clock, not the server's. The
+browser sends a full local timestamp with its UTC offset
+(`2026-07-29T19:26:57-07:00`) and the server records exactly that. This matters
+because the deployed server runs in UTC: derived from server time, an evening
+meal logged in the Americas would be filed under *tomorrow* and vanish from the
+Today view. The offset is mandatory on every write — a bare local time is
+rejected rather than guessed at.
 
 See [`templates/ANALYZE_INTAKE_PROMPT.md`](templates/ANALYZE_INTAKE_PROMPT.md)
 for exactly what the agent is told. Agent runs are sandboxed: no Bash, and each

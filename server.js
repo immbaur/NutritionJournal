@@ -169,37 +169,90 @@ function cleanLine(value, maxLen) {
 
 // --- Time / meal type -----------------------------------------------------
 
-// Local date/time parts, including the numeric UTC offset, so timestamps are
-// unambiguous and entry ids sort chronologically in local time.
-function localParts(d = new Date()) {
-  const pad = (n) => String(n).padStart(2, '0');
-  const y = d.getFullYear();
-  const mo = pad(d.getMonth() + 1);
-  const da = pad(d.getDate());
-  const h = pad(d.getHours());
-  const mi = pad(d.getMinutes());
-  const s = pad(d.getSeconds());
-  const offMin = -d.getTimezoneOffset();
-  const sign = offMin >= 0 ? '+' : '-';
-  const offAbs = Math.abs(offMin);
-  const off = `${sign}${pad(Math.floor(offAbs / 60))}:${pad(offAbs % 60)}`;
+// A meal's date and time are the *user's* wall clock, never the server's. The
+// server runs in UTC in deployment, so deriving them from process-local time
+// filed an evening meal under the next day and hid it from the Today view.
+// Every write therefore renders its parts at an explicit UTC offset, which the
+// client supplies (FR-13b); process-local time is only the last-resort default.
+
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+function formatOffset(offsetMinutes) {
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const abs = Math.abs(offsetMinutes);
+  return `${sign}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)}`;
+}
+
+// Renders an instant as wall-clock parts at a fixed UTC offset (minutes east of
+// UTC). Shifting the instant and reading the UTC fields gives the wall clock at
+// that offset regardless of the zone this process happens to run in.
+function partsAtOffset(d, offsetMinutes) {
+  const off = Number.isFinite(offsetMinutes) ? Math.round(offsetMinutes) : 0;
+  const shifted = new Date(d.getTime() + off * 60000);
+  const y = shifted.getUTCFullYear();
+  const mo = pad2(shifted.getUTCMonth() + 1);
+  const da = pad2(shifted.getUTCDate());
+  const h = pad2(shifted.getUTCHours());
+  const mi = pad2(shifted.getUTCMinutes());
+  const s = pad2(shifted.getUTCSeconds());
   return {
     date: `${y}-${mo}-${da}`,
-    timestamp: `${y}-${mo}-${da}T${h}:${mi}:${s}${off}`,
-    idStamp: `${y}-${mo}-${da}T${h}-${mi}-${s}`
+    timestamp: `${y}-${mo}-${da}T${h}:${mi}:${s}${formatOffset(off)}`,
+    idStamp: `${y}-${mo}-${da}T${h}-${mi}-${s}`,
+    hour: shifted.getUTCHours(),
+    offsetMinutes: off,
+    ms: d.getTime()
   };
 }
 
-function classifyMealType(d = new Date()) {
-  const hour = d.getHours();
+// Parts in the *server's* own zone. The fallback when the client tells us
+// nothing about its clock — correct only when the two share a timezone.
+function localParts(d = new Date()) {
+  return partsAtOffset(d, -d.getTimezoneOffset());
+}
+
+// Parses a client-supplied wall clock — `2026-07-29T19:26:57-07:00`. The UTC
+// offset is mandatory: a bare local time is exactly the ambiguity this path
+// exists to remove. Seconds are optional. Returns parts (as partsAtOffset) or
+// null if it is unparseable or implausible, so callers can reject explicitly
+// rather than silently record the wrong day.
+const WALL_CLOCK_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?(Z|[+-]\d{2}:\d{2})$/;
+const WALL_CLOCK_MIN_MS = Date.UTC(2000, 0, 1);
+// Tolerated clock skew ahead of the server, so a phone a few minutes fast (or
+// in a zone the server disagrees about) still saves. Not a way to pre-log meals.
+const WALL_CLOCK_MAX_FUTURE_MS = 24 * 60 * 60 * 1000;
+
+function parseWallClock(raw) {
+  if (typeof raw !== 'string') return null;
+  const m = WALL_CLOCK_RE.exec(raw.trim());
+  if (!m) return null;
+  const [, y, mo, da, h, mi, s, off] = m;
+  const offsetMinutes = off === 'Z'
+    ? 0
+    : (off[0] === '-' ? -1 : 1) * (Number(off.slice(1, 3)) * 60 + Number(off.slice(4, 6)));
+  const ms = Date.UTC(Number(y), Number(mo) - 1, Number(da), Number(h), Number(mi), Number(s || 0))
+    - offsetMinutes * 60000;
+  if (!Number.isFinite(ms)) return null;
+  if (ms < WALL_CLOCK_MIN_MS || ms > Date.now() + WALL_CLOCK_MAX_FUTURE_MS) return null;
+  const parts = partsAtOffset(new Date(ms), offsetMinutes);
+  // Round-trip guard: rejects impossible dates (2026-02-30) that Date.UTC
+  // happily rolls over into the next month.
+  if (parts.date !== `${y}-${mo}-${da}`) return null;
+  return parts;
+}
+
+// Meal type from the local hour the meal happened at. (FR-13)
+function classifyMealType(hour) {
   for (const w of MEAL_TYPE_WINDOWS) {
     if (hour >= w.start && hour < w.end) return w.type;
   }
   return 'snack';
 }
 
-function makeEntryId(d = new Date()) {
-  return `${localParts(d).idStamp}__${crypto.randomBytes(3).toString('hex')}`;
+function makeEntryId(parts = localParts()) {
+  return `${parts.idStamp}__${crypto.randomBytes(3).toString('hex')}`;
 }
 
 // --- Location -------------------------------------------------------------
@@ -328,8 +381,10 @@ function cleanConfidence(raw) {
 // Validates the editable content of a meal (from the agent's proposal or a
 // client confirm/edit) and returns a clean copy with only whitelisted fields,
 // so forged fields (entry_id, timestamps, media_refs, …) can never be injected
-// through the payload — the server owns those. Returns { content } or { error }.
-function validateAndCleanMeal(input) {
+// through the payload — the server owns those. `occurredParts` is when the meal
+// happened, used only to fall back on an auto-classified meal type.
+// Returns { content } or { error }.
+function validateAndCleanMeal(input, occurredParts = localParts()) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
     return { error: 'Meal must be an object.' };
   }
@@ -343,7 +398,7 @@ function validateAndCleanMeal(input) {
   }
 
   let mealType = typeof input.meal_type === 'string' ? input.meal_type.trim().toLowerCase() : '';
-  if (!MEAL_TYPES.includes(mealType)) mealType = classifyMealType();
+  if (!MEAL_TYPES.includes(mealType)) mealType = classifyMealType(occurredParts.hour);
 
   return {
     content: {
@@ -382,6 +437,20 @@ function roundTotals(totals) {
   return out;
 }
 
+// Orders meals newest-first by when they were eaten. entry_id encodes the time
+// a meal was *first* saved, so it stops tracking `timestamp` once the time is
+// edited (FR-16d) — the timestamp is the authority, entry_id only a tie-break.
+function mealInstant(meal) {
+  const t = Date.parse(meal && meal.timestamp);
+  return Number.isFinite(t) ? t : 0;
+}
+
+function byNewestFirst(a, b) {
+  const diff = mealInstant(b) - mealInstant(a);
+  if (diff !== 0) return diff;
+  return a.entry_id < b.entry_id ? 1 : -1;
+}
+
 // Reads every meal.json under data/meals/, newest first. Aggregation is always
 // computed on the fly from these files — there is no stored aggregate. (FR-16)
 function listMeals() {
@@ -397,7 +466,7 @@ function listMeals() {
     const meal = readJson(path.join(MEALS_DIR, id, 'meal.json'));
     if (meal && meal.entry_id) meals.push(meal);
   }
-  meals.sort((a, b) => (a.entry_id < b.entry_id ? 1 : -1));
+  meals.sort(byNewestFirst);
   return meals;
 }
 
@@ -421,7 +490,7 @@ function summariseMeal(meal) {
 function dayView(date, meals) {
   const dayMeals = meals
     .filter((m) => m.date === date)
-    .sort((a, b) => (a.entry_id < b.entry_id ? 1 : -1));
+    .sort(byNewestFirst);
   const totals = emptyTotals();
   dayMeals.forEach((m) => addToTotals(totals, m));
   return {
@@ -1001,6 +1070,14 @@ function readStagingStatus(stagingId) {
   return readJson(path.join(stagingDir(stagingId), 'status.json'));
 }
 
+// When the meal being staged happened, in the user's own wall clock. Captured
+// at upload from the client's clock and kept in meta.json, so meal-type
+// classification and the review screen's default both use the user's time
+// rather than the server's. (FR-13b)
+function stagedOccurredParts(meta) {
+  return parseWallClock(meta && meta.occurredAt) || localParts();
+}
+
 function writeStagingStatus(stagingId, status) {
   const dir = stagingDir(stagingId);
   if (!fs.existsSync(dir)) return;
@@ -1239,14 +1316,15 @@ function startAnalysis(stagingId) {
     // Meal analysis: resolve pantry hits server-side (FR-22a) and collect any
     // new-item proposals (FR-23) before validating the composed meal.
     const proposals = applyPantryToRawOutput(output, meta);
-    const { content, error } = validateAndCleanMeal(output);
+    const occurredParts = stagedOccurredParts(meta);
+    const { content, error } = validateAndCleanMeal(output, occurredParts);
     if (error) {
       finish({ status: 'error', message: `The agent produced an invalid estimate: ${error}` });
       return;
     }
     // Meal type is decided server-side from the entry time (reliable), not by
     // the agent; the user can still override it in review. (FR-13)
-    content.meal_type = classifyMealType();
+    content.meal_type = classifyMealType(occurredParts.hour);
     content.model_used = content.model_used || AGENT_MODEL;
     finish({ status: 'ready', result: content, proposed_pantry_items: proposals, analyzedAt: Date.now() });
   });
@@ -1270,8 +1348,9 @@ function pickExt(file, table, fallback) {
 
 // Writes uploaded photos/audio/text into the staging dir with canonical names
 // (photo-1.jpg, audio.webm, note.txt) and records them in meta.json. Returns
-// the meta describing what was stored.
-function persistUploads(dir, files, text, kind = 'meal') {
+// the meta describing what was stored. `occurredAt` is the client's wall clock
+// for the meal (already validated), null when it sent none.
+function persistUploads(dir, files, text, kind = 'meal', occurredAt = null) {
   const photos = [];
   (files.photos || []).slice(0, MAX_PHOTOS).forEach((file, i) => {
     const name = `photo-${i + 1}.${pickExt(file, IMAGE_EXT, 'jpg')}`;
@@ -1290,7 +1369,12 @@ function persistUploads(dir, files, text, kind = 'meal') {
   const hasNote = note.trim().length > 0;
   if (hasNote) fs.writeFileSync(path.join(dir, 'note.txt'), note);
 
-  const meta = { kind: kind === 'item' ? 'item' : 'meal', photos, audio, hasNote, note, createdAt: Date.now() };
+  const meta = {
+    kind: kind === 'item' ? 'item' : 'meal',
+    photos, audio, hasNote, note,
+    occurredAt,
+    createdAt: Date.now()
+  };
   writeJson(path.join(dir, 'meta.json'), meta);
   return meta;
 }
@@ -1380,13 +1464,22 @@ app.post('/api/intake', intakeUpload, (req, res) => {
     return res.status(400).json({ error: 'Add at least a photo, an audio note, or some text.' });
   }
 
+  // The client's own clock decides when this meal happened, so the recorded day
+  // is the user's, not the server's. (FR-13b) An explicit-but-unusable value is
+  // an error rather than a silent fallback to server time.
+  const rawOccurredAt = (req.body || {}).occurred_at;
+  const occurredParts = rawOccurredAt ? parseWallClock(rawOccurredAt) : null;
+  if (rawOccurredAt && !occurredParts) {
+    return res.status(400).json({ error: 'That date and time could not be read.' });
+  }
+
   const stagingId = `${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
   const dir = stagingDir(stagingId);
   fs.mkdirSync(dir, { recursive: true });
   writeStagingStatus(stagingId, { status: 'analyzing', createdAt: Date.now() });
 
   try {
-    persistUploads(dir, files, text);
+    persistUploads(dir, files, text, 'meal', occurredParts ? occurredParts.timestamp : null);
   } catch (err) {
     removeStaging(stagingId);
     return res.status(500).json({ error: `Could not save the upload: ${err.message}` });
@@ -1413,6 +1506,7 @@ app.get('/api/intake/:id', (req, res) => {
     items: status.items || [],
     media: { photos: meta.photos || [], audio: meta.audio || null, hasNote: !!meta.hasNote },
     note: meta.note || '',
+    occurred_at: meta.occurredAt || null,
     confidence_threshold: CONFIDENCE_THRESHOLD
   });
 });
@@ -1473,7 +1567,19 @@ app.post('/api/intake/:id/confirm', (req, res) => {
   const dir = stagingDir(stagingId);
   if (!fs.existsSync(dir)) return res.status(404).json({ error: 'This intake is no longer available.' });
 
-  const { content, error } = validateAndCleanMeal(req.body);
+  const meta = readJson(path.join(dir, 'meta.json')) || { photos: [], audio: null, hasNote: false };
+
+  // When the meal happened: what the user set in review wins, else the clock
+  // captured at upload, else (no client clock at all) the server's. This is what
+  // `date`, `timestamp`, and the entry id are all derived from, so a meal
+  // backfilled hours or days later lands on the right day. (FR-13a, FR-13b)
+  const rawOccurredAt = (req.body || {}).occurred_at;
+  if (rawOccurredAt && !parseWallClock(rawOccurredAt)) {
+    return res.status(400).json({ error: 'That date and time could not be read.' });
+  }
+  const parts = parseWallClock(rawOccurredAt) || stagedOccurredParts(meta);
+
+  const { content, error } = validateAndCleanMeal(req.body, parts);
   if (error) return res.status(400).json({ error });
 
   // Resolve the place name: user-stated wins; else reuse a nearby saved name;
@@ -1483,13 +1589,13 @@ app.post('/api/intake/:id/confirm', (req, res) => {
     content.location.name = findNearbyLocationName(content.location.lat, content.location.long, meals);
   }
 
-  const now = new Date();
-  const parts = localParts(now);
-  const entryId = makeEntryId(now);
+  // created_at/updated_at are the real save moment, rendered in the user's zone —
+  // for a backfilled entry they deliberately differ from `timestamp`.
+  const savedParts = partsAtOffset(new Date(), parts.offsetMinutes);
+  const entryId = makeEntryId(parts);
   const mealDir = path.join(MEALS_DIR, entryId);
   fs.mkdirSync(mealDir, { recursive: true });
 
-  const meta = readJson(path.join(dir, 'meta.json')) || { photos: [], audio: null, hasNote: false };
   const mediaRefs = [];
   try {
     (meta.photos || []).forEach((name) => {
@@ -1524,15 +1630,17 @@ app.post('/api/intake/:id/confirm', (req, res) => {
     confidence_note: content.confidence_note,
     model_used: content.model_used,
     schema_version: SCHEMA_VERSION,
-    created_at: parts.timestamp,
-    updated_at: parts.timestamp
+    created_at: savedParts.timestamp,
+    updated_at: savedParts.timestamp
   };
   writeJson(path.join(mealDir, 'meal.json'), meal);
 
   // Bump last_used_at on every pantry item this meal referenced, so the
   // most-recently-used tie-break stays meaningful. (FR-22) The agent never
-  // writes the pantry; the server does, here. (FR-30)
-  const touchedAt = parts.timestamp;
+  // writes the pantry; the server does, here. (FR-30) It records the save
+  // moment, not the meal's own time: backfilling last Tuesday's shake is still
+  // evidence that the powder is in current rotation.
+  const touchedAt = savedParts.timestamp;
   for (const item of meal.items) {
     if (item.origin === 'pantry' && item.pantry_item_id) touchPantryItemUsed(item.pantry_item_id, touchedAt);
   }
@@ -1622,7 +1730,18 @@ app.put('/api/meals/:id', (req, res) => {
   const existing = readJson(path.join(mealDir, 'meal.json'));
   if (!existing) return res.status(404).json({ error: 'Meal not found.' });
 
-  const { content, error } = validateAndCleanMeal(req.body);
+  // The meal's date/time is editable post-save — a mistyped time, or a day fixed
+  // after the fact. (FR-16d) entry_id and the folder name deliberately stay put:
+  // they are the entry's identity, referenced by media URLs and by pantry items'
+  // added_from_entry_id, so listings order by `timestamp` instead.
+  const rawOccurredAt = (req.body || {}).occurred_at;
+  const occurred = rawOccurredAt ? parseWallClock(rawOccurredAt) : null;
+  if (rawOccurredAt && !occurred) {
+    return res.status(400).json({ error: 'That date and time could not be read.' });
+  }
+  const timing = occurred || parseWallClock(existing.timestamp) || localParts();
+
+  const { content, error } = validateAndCleanMeal(req.body, timing);
   if (error) return res.status(400).json({ error });
 
   // Keep raw lat/long fixed; only the name is user-editable post-save.
@@ -1634,6 +1753,8 @@ app.put('/api/meals/:id', (req, res) => {
 
   const updated = {
     ...existing,
+    timestamp: timing.timestamp,
+    date: timing.date,
     meal_type: content.meal_type,
     nutrition: content.nutrition,
     items: content.items,
@@ -1641,7 +1762,7 @@ app.put('/api/meals/:id', (req, res) => {
     location,
     confidence: content.confidence,
     confidence_note: content.confidence_note,
-    updated_at: localParts().timestamp
+    updated_at: partsAtOffset(new Date(), timing.offsetMinutes).timestamp
   };
 
   // Keep note.txt consistent with the edited note.
@@ -1863,6 +1984,9 @@ module.exports = {
   classifyMealType,
   makeEntryId,
   localParts,
+  partsAtOffset,
+  parseWallClock,
+  byNewestFirst,
   haversineMeters,
   findNearbyLocationName,
   emptyTotals,

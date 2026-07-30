@@ -606,6 +606,18 @@ textarea { resize: vertical; }
 }
 .pf-basis-row input, .pf-size-row input, .pf-basis-row select, .pf-size-row select { padding: 0.5rem; }
 
+/* Date + time for a meal — side by side, so "when" reads as one field. The
+   minmax(0, …) tracks and min-width let the native date/time controls shrink
+   below their intrinsic width instead of pushing the card past a phone screen. */
+.when-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  gap: 0.5rem;
+  align-items: end;
+}
+.when-row label { min-width: 0; }
+.when-row input { min-width: 0; padding: 0.55rem 0.6rem; }
+
 .pf-nutrients { margin-top: 0.6rem; display: grid; gap: 0.4rem; }
 .pf-nutrient {
   display: grid;

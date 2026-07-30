@@ -265,7 +265,22 @@ abandoned files. Rules:
 - **FR-13** Meal type is inferred from local time (configurable default windows,
   e.g. breakfast 04–11, lunch 11–15, dinner 17–22, otherwise snack). User can
   override in the review step. Keep it invisible unless the user wants to change
-  it.
+  it. Changing the entry's time in review re-infers the type, until the user
+  picks one themselves.
+- **FR-13a (Settable date & time)** The review step exposes the entry's **date and
+  time**, defaulting to now, so a **forgotten meal can be logged
+  retrospectively**. Everything time-derived — `date`, `timestamp`, the entry id,
+  the auto meal type — follows what is set here, so a backfilled entry lands on
+  the day it was eaten. `created_at`/`updated_at` remain the real save moment and
+  so may differ from `timestamp`.
+- **FR-13b (The user's clock is authoritative)** "Local time" means the **user's**
+  wall clock, never the server's. The client sends a full local timestamp with an
+  explicit UTC offset (`2026-07-29T19:26:57-07:00`) on every write, and the server
+  records that offset rather than re-deriving parts from its own timezone — the
+  deployed server runs in UTC, where an evening meal in the Americas would
+  otherwise be filed under the next day and disappear from the Today view. A
+  timestamp without an offset is **rejected**, not guessed at; server-local time
+  is only a last-resort default when the client sends none at all.
 
 ### 5.6 Location
 
@@ -309,10 +324,16 @@ abandoned files. Rules:
   (items breakdown, ranges, confidence, original photos/audio/text, location),
   where the user can edit or delete it (FR-16a).
 - **FR-16a** **Post-save editing:** the user can edit or delete a previously saved
-  entry (correct any nutrient value, meal type, location name, or note; remove the
-  entry entirely). An edit **rewrites only that entry's `meal.json`** atomically;
-  a delete removes (or tombstones) that single meal folder. No other entry is
-  affected, and totals recompute automatically.
+  entry (correct any nutrient value, meal type, location name, note, or its date
+  and time; remove the entry entirely). An edit **rewrites only that entry's
+  `meal.json`** atomically; a delete removes (or tombstones) that single meal
+  folder. No other entry is affected, and totals recompute automatically.
+- **FR-16d (Re-timing a saved entry)** Editing a saved entry's date/time moves it
+  between days (both days' totals recompute on the fly). The **`entry_id` and its
+  folder name do not change** — they are the entry's identity, referenced by media
+  URLs and by pantry items' `added_from_entry_id` — so an edited entry's id may no
+  longer match its `timestamp`. Listings therefore **order by `timestamp`**, using
+  `entry_id` only as a tie-break.
 - **FR-16b** **CSV export:** the user can export the full history to CSV
   on demand (a button/endpoint), and/or a small script (`export-csv`) regenerates
   `data/intake-history.csv` from all JSON files. The CSV is always a **derived
@@ -422,6 +443,9 @@ contaminate every future meal that reuses it.
 Each confirmed meal gets its **own folder**, `data/meals/<entry_id>/`, containing
 the structured entry plus its raw inputs. The `<entry_id>` is sortable by time
 (e.g. `2026-07-29T12-30-05__a1b2c3`), so listing `data/meals/` is chronological.
+It is minted from the entry's time in the **user's** zone (FR-13a, FR-13b) and is
+then **immutable**: re-timing an entry later leaves the id alone, which is why
+`timestamp` — not the id — is what listings sort on (FR-16d).
 
 ```
 data/meals/<entry_id>/

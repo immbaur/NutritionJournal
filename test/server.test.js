@@ -12,6 +12,9 @@ const {
   classifyMealType,
   makeEntryId,
   localParts,
+  partsAtOffset,
+  parseWallClock,
+  byNewestFirst,
   haversineMeters,
   findNearbyLocationName,
   emptyTotals,
@@ -183,15 +186,15 @@ test('validateAndCleanMeal falls back to a time-based meal type when invalid', (
 // --- Meal type / ids / time ----------------------------------------------
 
 test('classifyMealType maps hours to windows', () => {
-  assert.equal(classifyMealType(new Date(2026, 6, 29, 8)), 'breakfast');
-  assert.equal(classifyMealType(new Date(2026, 6, 29, 12)), 'lunch');
-  assert.equal(classifyMealType(new Date(2026, 6, 29, 19)), 'dinner');
-  assert.equal(classifyMealType(new Date(2026, 6, 29, 2)), 'snack');
-  assert.equal(classifyMealType(new Date(2026, 6, 29, 16)), 'snack');
+  assert.equal(classifyMealType(8), 'breakfast');
+  assert.equal(classifyMealType(12), 'lunch');
+  assert.equal(classifyMealType(19), 'dinner');
+  assert.equal(classifyMealType(2), 'snack');
+  assert.equal(classifyMealType(16), 'snack');
 });
 
 test('makeEntryId is sortable and matches the id pattern', () => {
-  const id = makeEntryId(new Date(2026, 6, 29, 12, 30, 5));
+  const id = makeEntryId(localParts(new Date(2026, 6, 29, 12, 30, 5)));
   assert.match(id, /^2026-07-29T12-30-05__[0-9a-f]{6}$/);
 });
 
@@ -200,6 +203,61 @@ test('localParts produces date, timestamp, and idStamp', () => {
   assert.equal(p.date, '2026-07-29');
   assert.equal(p.idStamp, '2026-07-29T12-30-05');
   assert.match(p.timestamp, /^2026-07-29T12:30:05[+-]\d{2}:\d{2}$/);
+});
+
+// The bug this guards: rendering an instant with the *server's* zone filed a
+// 19:26 PDT dinner as 2026-07-30 (UTC), a day the Today view never shows.
+test('partsAtOffset renders an instant at the given offset, not the process zone', () => {
+  const instant = new Date('2026-07-30T02:26:57Z');
+  const pdt = partsAtOffset(instant, -420);
+  assert.equal(pdt.date, '2026-07-29');
+  assert.equal(pdt.timestamp, '2026-07-29T19:26:57-07:00');
+  assert.equal(pdt.idStamp, '2026-07-29T19-26-57');
+  assert.equal(pdt.hour, 19);
+
+  const utc = partsAtOffset(instant, 0);
+  assert.equal(utc.date, '2026-07-30');
+  assert.equal(utc.timestamp, '2026-07-30T02:26:57+00:00');
+
+  const kathmandu = partsAtOffset(instant, 345);
+  assert.equal(kathmandu.timestamp, '2026-07-30T08:11:57+05:45');
+});
+
+test('parseWallClock reads a client wall clock and keeps its offset', () => {
+  const p = parseWallClock('2026-07-29T19:26:57-07:00');
+  assert.equal(p.date, '2026-07-29');
+  assert.equal(p.timestamp, '2026-07-29T19:26:57-07:00');
+  assert.equal(p.hour, 19);
+  assert.equal(p.offsetMinutes, -420);
+  assert.equal(p.ms, Date.parse('2026-07-30T02:26:57Z'));
+
+  // Seconds optional, Z accepted.
+  assert.equal(parseWallClock('2026-07-29T08:15Z').timestamp, '2026-07-29T08:15:00+00:00');
+});
+
+test('parseWallClock rejects anything ambiguous, impossible, or out of range', () => {
+  assert.equal(parseWallClock('2026-07-29T19:26:57'), null, 'no offset is ambiguous');
+  assert.equal(parseWallClock('2026-02-30T12:00:00Z'), null, 'date does not exist');
+  assert.equal(parseWallClock('1999-12-31T23:59:59Z'), null, 'implausibly old');
+  assert.equal(parseWallClock('not a date'), null);
+  assert.equal(parseWallClock(''), null);
+  assert.equal(parseWallClock(null), null);
+  const farFuture = new Date(Date.now() + 40 * 60 * 60 * 1000).toISOString().replace(/\.\d+Z$/, 'Z');
+  assert.equal(parseWallClock(farFuture), null, 'beyond tolerated clock skew');
+});
+
+test('byNewestFirst orders by timestamp, using entry_id only to break ties', () => {
+  // An edited meal keeps its original entry_id, so ordering must follow the
+  // timestamp even when the two disagree. (FR-16d)
+  const early = { entry_id: '2026-07-30T02-03-05__aaaaaa', timestamp: '2026-07-29T09:00:00-07:00' };
+  const late = { entry_id: '2026-07-29T23-23-28__bbbbbb', timestamp: '2026-07-29T19:00:00-07:00' };
+  assert.deepEqual([early, late].sort(byNewestFirst), [late, early]);
+
+  const sameTime = [
+    { entry_id: '2026-07-29T12-00-00__aaaaaa', timestamp: '2026-07-29T12:00:00-07:00' },
+    { entry_id: '2026-07-29T12-00-00__bbbbbb', timestamp: '2026-07-29T12:00:00-07:00' }
+  ];
+  assert.equal(sameTime.slice().sort(byNewestFirst)[0].entry_id, '2026-07-29T12-00-00__bbbbbb');
 });
 
 // --- Location matching ----------------------------------------------------
@@ -224,7 +282,7 @@ test('findNearbyLocationName reuses a name within tolerance, else empty', () => 
 
 function meal(date, cals, protein) {
   return {
-    entry_id: makeEntryId(new Date(date + 'T12:00:00')),
+    entry_id: makeEntryId(localParts(new Date(date + 'T12:00:00'))),
     date,
     timestamp: date + 'T12:00:00+00:00',
     meal_type: 'lunch',
