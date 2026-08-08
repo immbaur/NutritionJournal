@@ -434,6 +434,49 @@ contaminate every future meal that reuses it.
   proposes items in the isolated staging workspace; the **server** validates and
   writes `data/pantry/<item_id>/item.json` on user confirm.
 
+### 5.10 Recipes (saved meals)
+
+The pantry remembers **ingredients**; the recipe book remembers **whole meals**.
+Where a pantry item is composed arithmetically into a meal alongside others
+(FR-22a), a recipe *is* one meal's totals, reused as a unit. A meal eaten
+repeatedly should be analyzed once, not re-analyzed every time.
+
+- **FR-31 (Recipe store)** A **Recipes screen** lists saved meals
+  most-recently-used first, with search over name / items / note, and allows
+  opening one for detail.
+- **FR-31a (Manage)** A recipe can be **edited** (name, nutrient values, items,
+  note) and **deleted**. Editing rewrites only that recipe's folder.
+- **FR-32 (Saving a recipe)** A meal can be saved to the recipe book **two
+  ways**: a *"Save to recipe book"* checkbox in the **review** step (with a name
+  defaulted from the items, else the note, else the meal type), and a **"Save as
+  recipe"** action on **any already-saved meal**, however old. Both copy the
+  meal's nutrition, items and note, plus one identifying photo. Saving a recipe
+  is **best-effort and never blocks the meal** — a failure here must not cost the
+  user the entry itself.
+- **FR-33 (Logging a recipe)** From the intake screen the user can pick a saved
+  recipe instead of providing any input. This **spawns no agent and makes no
+  model call** — the numbers were settled when the recipe was saved. Meal type is
+  **not** stored on the recipe: it is classified from the time the meal is being
+  eaten (FR-13), so one recipe is breakfast at 8am and a snack at 4pm.
+- **FR-33a (Portion)** Logging asks for a **portion multiplier** (bounded, e.g.
+  0.05–20). Nutrient `value`/`low`/`high` all scale. Item **amounts are free text
+  that cannot be re-arithmetised**, so they are instead **marked** with the
+  multiplier (`0.5 × 120 g`) rather than left silently contradicting the scaled
+  totals. Scaling happens **server-side, once**, so the review path and the
+  one-tap path can never disagree.
+- **FR-33b (Two speeds)** Picking a recipe **opens the prefilled review screen**
+  (time, place, and every number still adjustable); a **"Log now"** action on
+  each row writes it straight to the day at the current time in one tap. The
+  one-tap path saves **without location** rather than blocking on a geolocation
+  prompt (FR-14b).
+- **FR-34 (Snapshots, not links)** Meals store the recipe's **resolved values**
+  plus its `recipe_id` and a **snapshot of its name** — so editing or deleting a
+  recipe **never rewrites meals already logged from it** (mirroring FR-29), and a
+  meal whose recipe is gone still reads correctly.
+- **FR-34a (Re-analysis is withheld)** An entry staged from a recipe does **not**
+  offer "re-analyze": re-running the agent would discard numbers that are already
+  exact and replace them with an estimate.
+
 ---
 
 ## 6. Data Model
@@ -602,6 +645,62 @@ Field notes:
 - The pantry has **no shared index file**: the match index (FR-21) is built in
   memory from the item folders at analysis time, so there is nothing to keep in
   sync and nothing whose corruption could take out the pantry.
+
+### 6.5 Recipes: one folder per saved meal
+
+The third store, in the same shape again — one folder per record, `recipe.json`
+as the source of truth, one identifying photo beside it:
+
+```
+data/recipes/<recipe_id>/
+  recipe.json      # the structured recipe — the source of truth
+  photo-1.jpg      # one identifying photo, copied from the meal it came from
+```
+
+`<recipe_id>` is a slug plus a short random suffix, same shape as `item_id`.
+
+```json
+{
+  "recipe_id": "banana-protein-shake__a1b2c3",
+  "name": "Banana Protein Shake",
+  "nutrition": {
+    "calories":  { "value": 240, "low": 220, "high": 260, "unit": "kcal" },
+    "protein_g": { "value": 26 },
+    "fat_g":     { "value": 1.5 },
+    "carbs_g":   { "value": 30 },
+    "fiber_g":   { "value": 3 }
+  },
+  "items": [
+    { "name": "banana", "amount": "120 g", "origin": "user-stated", "pantry_item_id": null },
+    { "name": "whey isolate", "amount": "1 scoop", "origin": "pantry", "pantry_item_id": "whey-isopure__9b7a00" }
+  ],
+  "note": "morning shake",
+  "media_refs": ["photo-1.jpg"],
+  "source_entry_id": "2026-07-29T12-30-05__a1b2c3",
+  "confidence": 0.85,
+  "confidence_note": "grams given for the banana; scoop assumed 30 g",
+  "model_used": "opus",
+  "times_logged": 12,
+  "last_used_at": "2026-08-08T08:14:02-07:00",
+  "schema_version": 1,
+  "created_at": "2026-07-29T12:30:09-07:00",
+  "updated_at": "2026-07-29T12:30:09-07:00"
+}
+```
+
+Field notes:
+- **`nutrition` is per one portion** — the amounts the recipe was saved with. A
+  part-portion is applied at log time (FR-33a), never stored back here.
+- **`items`** keep their `origin` and `pantry_item_id`, so a recipe built from a
+  pantry-resolved meal stays traceable to the items that produced it.
+- **No `meal_type`**: a recipe is a *what*, not a *when*. Type is classified from
+  the time it is logged (FR-13, FR-33).
+- **`source_entry_id`** links back to the meal it was saved from; **`times_logged`
+  / `last_used_at`** drive the picker's most-recently-used order.
+- Meals logged from a recipe carry **`from_recipe_id`** plus a snapshotted
+  **`from_recipe_name`** and their own resolved values (FR-34) — so the link is
+  for provenance and thumbnails only, never a live reference that could rewrite
+  history.
 
 ---
 

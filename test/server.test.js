@@ -37,6 +37,12 @@ const {
   findMatchingPantryItem,
   resolvePantryContribution,
   addNutritionInto,
+  makeRecipeId,
+  validateAndCleanRecipe,
+  cleanRecipeScale,
+  scaleRecipeContent,
+  summariseRecipe,
+  defaultRecipeName,
   NUTRIENTS
 } = require('../server.js');
 
@@ -623,4 +629,122 @@ test('addNutritionInto sums a contribution into a meal nutrition object', () => 
   assert.equal(nutrition.calories.low, 180);   // band preserved
   assert.equal(nutrition.fat_g.value, 6.1);    // 5 + 1.1
   assert.equal(nutrition.fiber_g.value, null); // null + null stays null
+});
+
+// --- Recipes (saved meals) ------------------------------------------------
+
+const RECIPE_INPUT = {
+  name: 'Banana Protein Shake',
+  nutrition: {
+    calories: { value: 240, low: 220, high: 260 },
+    protein_g: { value: 26 },
+    fat_g: { value: 1.5 },
+    carbs_g: { value: 30 },
+    fiber_g: { value: 3 }
+  },
+  items: [
+    { name: 'banana', amount: '120 g', origin: 'user-stated' },
+    { name: 'whey isolate', amount: '1 scoop', origin: 'pantry', pantry_item_id: 'whey__9b7a00', pantry_name: 'Isopure whey' }
+  ],
+  note: 'morning shake'
+};
+
+test('makeRecipeId slugs the name with a random suffix', () => {
+  assert.match(makeRecipeId('Banana Protein Shake'), /^banana-protein-shake__[0-9a-f]{6}$/);
+  // An unsluggable name still yields a usable, path-safe id.
+  assert.match(makeRecipeId('!!!'), /^recipe__[0-9a-f]{6}$/);
+});
+
+test('validateAndCleanRecipe keeps whitelisted fields and pantry provenance', () => {
+  const { content, error } = validateAndCleanRecipe(RECIPE_INPUT);
+  assert.equal(error, undefined);
+  assert.equal(content.name, 'Banana Protein Shake');
+  assert.equal(content.nutrition.calories.value, 240);
+  assert.equal(content.nutrition.calories.unit, 'kcal');
+  assert.equal(content.items.length, 2);
+  assert.equal(content.items[1].origin, 'pantry');
+  assert.equal(content.items[1].pantry_item_id, 'whey__9b7a00');
+});
+
+test('validateAndCleanRecipe rejects a nameless recipe and bad nutrition', () => {
+  assert.ok(validateAndCleanRecipe({ ...RECIPE_INPUT, name: '   ' }).error);
+  assert.ok(validateAndCleanRecipe('nope').error);
+  assert.ok(validateAndCleanRecipe({ ...RECIPE_INPUT, nutrition: { calories: { value: -1 } } }).error);
+});
+
+test('validateAndCleanRecipe cannot be handed server-owned fields', () => {
+  const { content } = validateAndCleanRecipe({
+    ...RECIPE_INPUT,
+    recipe_id: '../../etc__aaaaaa',
+    times_logged: 999,
+    created_at: '1999-01-01T00:00:00+00:00'
+  });
+  assert.equal(content.recipe_id, undefined);
+  assert.equal(content.times_logged, undefined);
+  assert.equal(content.created_at, undefined);
+});
+
+test('cleanRecipeScale defaults to 1 and rejects what is out of range', () => {
+  assert.equal(cleanRecipeScale(undefined), 1);
+  assert.equal(cleanRecipeScale(''), 1);
+  assert.equal(cleanRecipeScale('0.5'), 0.5);
+  assert.equal(cleanRecipeScale(2), 2);
+  assert.equal(cleanRecipeScale(0.756), 0.76); // rounded to 2dp
+  assert.equal(cleanRecipeScale(0), null);
+  assert.equal(cleanRecipeScale(-1), null);
+  assert.equal(cleanRecipeScale(100), null);
+  assert.equal(cleanRecipeScale('abc'), null);
+});
+
+test('scaleRecipeContent scales every nutrient bound and marks item amounts', () => {
+  const { content } = validateAndCleanRecipe(RECIPE_INPUT);
+  const half = scaleRecipeContent(content, 0.5);
+  assert.equal(half.nutrition.calories.value, 120);
+  assert.equal(half.nutrition.calories.low, 110);
+  assert.equal(half.nutrition.calories.high, 130);
+  assert.equal(half.nutrition.protein_g.value, 13);
+  // Item text cannot be re-arithmetised, so it is marked rather than left
+  // silently contradicting the halved totals.
+  assert.equal(half.items[0].amount, '0.5 × 120 g');
+  assert.equal(half.items[1].amount, '0.5 × 1 scoop');
+  // The original is untouched — scaling never mutates the stored recipe.
+  assert.equal(content.nutrition.calories.value, 240);
+  assert.equal(content.items[0].amount, '120 g');
+});
+
+test('scaleRecipeContent at 1 is an exact no-op', () => {
+  const { content } = validateAndCleanRecipe(RECIPE_INPUT);
+  assert.equal(scaleRecipeContent(content, 1), content);
+});
+
+test('scaling keeps a null fiber null rather than turning it into 0', () => {
+  const { content } = validateAndCleanRecipe({
+    ...RECIPE_INPUT,
+    nutrition: { ...RECIPE_INPUT.nutrition, fiber_g: { value: null } }
+  });
+  assert.equal(scaleRecipeContent(content, 2).nutrition.fiber_g.value, null);
+});
+
+test('scaling clamps at the nutrient ceiling instead of overflowing', () => {
+  const { content } = validateAndCleanRecipe({
+    ...RECIPE_INPUT,
+    nutrition: { ...RECIPE_INPUT.nutrition, calories: { value: 15000 } }
+  });
+  const cal = NUTRIENTS.find((n) => n.key === 'calories');
+  assert.equal(scaleRecipeContent(content, 20).nutrition.calories.value, cal.max);
+});
+
+test('summariseRecipe exposes the display fields and defaults the counters', () => {
+  const s = summariseRecipe({ recipe_id: 'x__aaaaaa', name: 'X', nutrition: {}, items: [] });
+  assert.equal(s.times_logged, 0);
+  assert.equal(s.last_used_at, null);
+  assert.equal(s.confidence, null);
+  assert.deepEqual(s.media_refs, []);
+});
+
+test('defaultRecipeName falls back item names -> note -> meal type', () => {
+  assert.equal(defaultRecipeName({ items: [{ name: 'rice' }, { name: 'chicken' }] }), 'rice, chicken');
+  assert.equal(defaultRecipeName({ items: [], note: 'leftover curry\nsecond line' }), 'leftover curry');
+  assert.equal(defaultRecipeName({ items: [], note: '', meal_type: 'dinner' }), 'Dinner');
+  assert.equal(defaultRecipeName({}), 'Saved meal');
 });

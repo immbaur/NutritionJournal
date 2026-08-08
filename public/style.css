@@ -606,6 +606,48 @@ textarea { resize: vertical; }
 }
 .pf-basis-row input, .pf-size-row input, .pf-basis-row select, .pf-size-row select { padding: 0.5rem; }
 
+/* --- Recipes ------------------------------------------------------------- */
+
+/* The "eaten this before?" shortcut sits above the capture fields on New
+   Intake, so the zero-effort path is the first thing offered. */
+.recipe-shortcut { padding-bottom: 1rem; }
+.recipe-shortcut .secondary-btn { margin-top: 0.5rem; }
+
+.log-now-btn {
+  background: var(--accent-dim);
+  color: var(--text);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.log-now-btn:active { background: var(--accent); }
+
+.recipe-from {
+  font-size: 0.85rem;
+  line-height: 1.45;
+  color: var(--text-dim);
+  border-color: var(--accent-dim);
+}
+.recipe-from strong { color: var(--text); }
+
+/* Portion picker — the multiplier chosen before a recipe is logged. */
+.portion-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.4rem; }
+.portion-btn {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 0.6rem 0.2rem;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+.portion-btn.selected { background: var(--accent-dim); border-color: var(--accent); font-weight: 600; }
+
 /* Date + time for a meal — side by side, so "when" reads as one field. The
    minmax(0, …) tracks and min-width let the native date/time controls shrink
    below their intrinsic width instead of pushing the card past a phone screen. */

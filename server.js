@@ -9,6 +9,7 @@ const PORT = process.env.PORT || 3000;
 const DATA_DIR = path.join(__dirname, 'data');
 const MEALS_DIR = path.join(DATA_DIR, 'meals');
 const PANTRY_DIR = path.join(DATA_DIR, 'pantry');
+const RECIPES_DIR = path.join(DATA_DIR, 'recipes');
 const AGENT_WORKSPACE_DIR = path.join(DATA_DIR, 'agent-workspace');
 const HISTORY_CSV_PATH = path.join(DATA_DIR, 'intake-history.csv');
 const AUTH_PATH = path.join(DATA_DIR, 'auth.json');
@@ -74,8 +75,19 @@ const LIMITS = {
   itemBrand: 80,
   alias: 80,
   maxAliases: 20,
-  maxPantryItems: 40 // per one deliberate "New Item" submission
+  maxPantryItems: 40, // per one deliberate "New Item" submission
+  // Recipes
+  recipeName: 120
 };
+
+// A recipe keeps one photo purely so the picker and the meal list have a
+// thumbnail — it is an identifying image, not the recipe's evidence.
+const MAX_RECIPE_PHOTOS = 1;
+// Portion multiplier when logging a saved recipe (FR-33a). Bounded so a typo
+// cannot write an absurd entry; the nutrient caps in NUTRIENTS still apply after
+// scaling.
+const MIN_RECIPE_SCALE = 0.05;
+const MAX_RECIPE_SCALE = 20;
 
 // Basis / serving / package units. Nutrition is stored on a canonical per-100
 // basis (FR-20); solids per 100 g, liquids per 100 ml.
@@ -120,12 +132,14 @@ const STAGING_ID_RE = /^\d{13}-[0-9a-f]{6}$/;
 const MEDIA_NAME_RE = /^[A-Za-z0-9._-]+$/;
 // item_id is a slug plus a short random suffix, e.g. almond-milk-alpro__7f3a91,
 // stable for the item's lifetime so meals can reference it. (§6.4) Also guards
-// path traversal on data/pantry/.
+// path traversal on data/pantry/. recipe_id has the same shape (§6.5).
 const ITEM_ID_RE = /^[a-z0-9-]+__[0-9a-f]{6}$/;
+const RECIPE_ID_RE = ITEM_ID_RE;
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(MEALS_DIR)) fs.mkdirSync(MEALS_DIR, { recursive: true });
 if (!fs.existsSync(PANTRY_DIR)) fs.mkdirSync(PANTRY_DIR, { recursive: true });
+if (!fs.existsSync(RECIPES_DIR)) fs.mkdirSync(RECIPES_DIR, { recursive: true });
 if (!fs.existsSync(AGENT_WORKSPACE_DIR)) fs.mkdirSync(AGENT_WORKSPACE_DIR, { recursive: true });
 
 // --- JSON file helpers ----------------------------------------------------
@@ -470,7 +484,14 @@ function listMeals() {
   return meals;
 }
 
-function summariseMeal(meal) {
+// `recipeThumbs` maps recipe_id -> photo filename. A meal logged from a recipe
+// took no photo of its own, so rather than copy the recipe's picture into the
+// meal folder — which would misrepresent it as a raw input of that meal (§6.1) —
+// the summary points at the recipe's copy, and the list falls back to the
+// placeholder once the recipe is gone.
+function summariseMeal(meal, recipeThumbs) {
+  const fromRecipeId = meal.from_recipe_id || null;
+  const thumb = (fromRecipeId && recipeThumbs && recipeThumbs.get(fromRecipeId)) || '';
   return {
     entry_id: meal.entry_id,
     timestamp: meal.timestamp,
@@ -481,10 +502,26 @@ function summariseMeal(meal) {
     note: meal.note || '',
     location: meal.location || { lat: null, long: null, name: '' },
     media_refs: meal.media_refs || [],
+    from_recipe_id: fromRecipeId,
+    from_recipe_name: meal.from_recipe_name || '',
+    from_recipe_photo: thumb,
     confidence: meal.confidence != null ? meal.confidence : null,
     confidence_note: meal.confidence_note || '',
     model_used: meal.model_used || ''
   };
+}
+
+// Built only when a day actually holds recipe-logged meals, so the common case
+// reads nothing extra off disk.
+function recipeThumbIndex(meals) {
+  const thumbs = new Map();
+  for (const meal of meals) {
+    const id = meal.from_recipe_id;
+    if (!id || thumbs.has(id) || !RECIPE_ID_RE.test(id)) continue;
+    const recipe = readJson(path.join(RECIPES_DIR, id, 'recipe.json'));
+    thumbs.set(id, (recipe && (recipe.media_refs || [])[0]) || '');
+  }
+  return thumbs;
 }
 
 function dayView(date, meals) {
@@ -493,10 +530,11 @@ function dayView(date, meals) {
     .sort(byNewestFirst);
   const totals = emptyTotals();
   dayMeals.forEach((m) => addToTotals(totals, m));
+  const thumbs = recipeThumbIndex(dayMeals);
   return {
     date,
     totals: roundTotals(totals),
-    meals: dayMeals.map(summariseMeal)
+    meals: dayMeals.map((m) => summariseMeal(m, thumbs))
   };
 }
 
@@ -888,6 +926,309 @@ function savePantryItems(accepted, opts = {}) {
   return saved;
 }
 
+// --- Recipes (saved meals) ------------------------------------------------
+// A third store in the same shape as the other two: one folder per recipe under
+// data/recipes/<recipe_id>/, recipe.json as the source of truth, one identifying
+// photo beside it. (§6.5) A recipe is a *whole meal* worth reusing — its
+// nutrition is already known, so logging one costs no model call at all (FR-33),
+// which is the entire point of the feature.
+//
+// Deliberately NOT a pantry item: pantry items are ingredients priced per 100
+// g/ml and composed arithmetically into a meal (FR-22a), whereas a recipe is one
+// finished meal's totals, reused as a unit.
+
+function makeRecipeId(name) {
+  const slug = slugify(name) || 'recipe';
+  return `${slug}__${crypto.randomBytes(3).toString('hex')}`;
+}
+
+// Validates the editable content of a recipe. Same whitelist discipline as
+// meals: the server owns recipe_id, provenance, counters and timestamps, so
+// none of them can be injected through a payload.
+function validateAndCleanRecipe(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return { error: 'Recipe must be an object.' };
+  }
+  const name = cleanLine(input.name, LIMITS.recipeName).trim();
+  if (!name) return { error: 'A recipe needs a name.' };
+
+  const nutritionInput = input.nutrition && typeof input.nutrition === 'object' ? input.nutrition : {};
+  const nutrition = {};
+  for (const cfg of NUTRIENTS) {
+    const { nutrient, error } = cleanNutrient(nutritionInput[cfg.key], cfg);
+    if (error) return { error };
+    nutrition[cfg.key] = nutrient;
+  }
+
+  return {
+    content: {
+      name,
+      nutrition,
+      items: cleanItems(input.items),
+      note: cleanText(input.note, LIMITS.note),
+      confidence: cleanConfidence(input.confidence),
+      confidence_note: cleanLine(input.confidence_note, LIMITS.confidenceNote),
+      model_used: cleanLine(input.model_used, LIMITS.modelUsed)
+    }
+  };
+}
+
+// A portion multiplier, or null when the input is unusable/out of range so the
+// caller can reject it rather than silently log the wrong amount.
+function cleanRecipeScale(raw) {
+  if (raw == null || raw === '') return 1;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return null;
+  const rounded = Math.round(n * 100) / 100;
+  if (rounded < MIN_RECIPE_SCALE || rounded > MAX_RECIPE_SCALE) return null;
+  return rounded;
+}
+
+// Scales a recipe's numbers for a part-portion (FR-33a). Item *amounts* are free
+// text ("120 g banana", "1 scoop") that cannot be re-arithmetised, so instead of
+// silently leaving them contradicting the scaled totals they are marked with the
+// multiplier — the entry stays internally honest about what was eaten.
+function scaleRecipeContent(content, scale) {
+  if (scale === 1) return content;
+  const nutrition = {};
+  for (const cfg of NUTRIENTS) {
+    const cur = content.nutrition[cfg.key] || {};
+    const mul = (v) => (typeof v === 'number' && Number.isFinite(v)
+      ? Math.round(Math.min(v * scale, cfg.max) * 100) / 100
+      : null);
+    nutrition[cfg.key] = { ...cur, value: mul(cur.value), low: mul(cur.low), high: mul(cur.high) };
+  }
+  const items = content.items.map((item) => ({
+    ...item,
+    amount: item.amount ? cleanLine(`${scale} × ${item.amount}`, LIMITS.itemAmount).trim() : item.amount
+  }));
+  return { ...content, nutrition, items };
+}
+
+function listRecipes() {
+  let ids;
+  try {
+    ids = fs.readdirSync(RECIPES_DIR);
+  } catch (err) {
+    return [];
+  }
+  const recipes = [];
+  for (const id of ids) {
+    if (!RECIPE_ID_RE.test(id)) continue;
+    const recipe = readJson(path.join(RECIPES_DIR, id, 'recipe.json'));
+    if (recipe && recipe.recipe_id) recipes.push(recipe);
+  }
+  // Most recently used first, so what you eat often stays at the top of the
+  // picker; never-logged recipes fall back to when they were created.
+  recipes.sort((a, b) => {
+    const key = (r) => r.last_used_at || r.created_at || '';
+    const ak = key(a);
+    const bk = key(b);
+    if (ak === bk) return a.name.localeCompare(b.name);
+    return ak < bk ? 1 : -1;
+  });
+  return recipes;
+}
+
+function summariseRecipe(recipe) {
+  return {
+    recipe_id: recipe.recipe_id,
+    name: recipe.name,
+    nutrition: recipe.nutrition,
+    items: recipe.items || [],
+    note: recipe.note || '',
+    media_refs: recipe.media_refs || [],
+    source_entry_id: recipe.source_entry_id || null,
+    confidence: recipe.confidence != null ? recipe.confidence : null,
+    confidence_note: recipe.confidence_note || '',
+    model_used: recipe.model_used || '',
+    times_logged: recipe.times_logged || 0,
+    last_used_at: recipe.last_used_at || null,
+    created_at: recipe.created_at || null
+  };
+}
+
+// Copies the identifying photo out of a meal folder into the recipe's own, so
+// each store stays independently self-contained. (FR-12b, same rule as pantry)
+function copyRecipePhotos(recipeDir, srcDir, mediaRefs) {
+  const out = [];
+  for (const name of mediaRefs || []) {
+    if (out.length >= MAX_RECIPE_PHOTOS) break;
+    if (!MEDIA_NAME_RE.test(name)) continue;
+    if (!/\.(jpg|jpeg|png|webp|gif|heic|heif)$/i.test(name)) continue;
+    const src = path.join(srcDir, name);
+    if (!fs.existsSync(src)) continue;
+    const ext = (path.extname(name).replace('.', '') || 'jpg').toLowerCase();
+    const destName = `photo-${out.length + 1}.${ext}`;
+    try {
+      fs.copyFileSync(src, path.join(recipeDir, destName));
+      out.push(destName);
+    } catch (err) { /* an unreadable source just means no thumbnail */ }
+  }
+  return out;
+}
+
+// Writes a new recipe folder. opts: { sourceEntryId, srcDir, mediaRefs }.
+function createRecipe(content, opts = {}) {
+  const now = localParts();
+  const recipeId = makeRecipeId(content.name);
+  const recipeDir = path.join(RECIPES_DIR, recipeId);
+  fs.mkdirSync(recipeDir, { recursive: true });
+  const mediaRefs = opts.srcDir ? copyRecipePhotos(recipeDir, opts.srcDir, opts.mediaRefs) : [];
+  const recipe = {
+    recipe_id: recipeId,
+    name: content.name,
+    nutrition: content.nutrition,
+    items: content.items,
+    note: content.note,
+    media_refs: mediaRefs,
+    source_entry_id: opts.sourceEntryId || null,
+    confidence: content.confidence,
+    confidence_note: content.confidence_note,
+    model_used: content.model_used,
+    times_logged: 0,
+    last_used_at: null,
+    schema_version: SCHEMA_VERSION,
+    created_at: now.timestamp,
+    updated_at: now.timestamp
+  };
+  writeJson(path.join(recipeDir, 'recipe.json'), recipe);
+  return recipe;
+}
+
+// Rewrites a recipe's editable fields, preserving everything the server owns.
+function updateRecipe(recipeId, content) {
+  if (!RECIPE_ID_RE.test(recipeId)) return null;
+  const p = path.join(RECIPES_DIR, recipeId, 'recipe.json');
+  const existing = readJson(p);
+  if (!existing) return null;
+  const updated = {
+    ...existing,
+    name: content.name,
+    nutrition: content.nutrition,
+    items: content.items,
+    note: content.note,
+    confidence: content.confidence,
+    confidence_note: content.confidence_note,
+    updated_at: localParts().timestamp
+  };
+  writeJson(p, updated);
+  return updated;
+}
+
+// Bumps the use counter so the picker's most-recently-used order is meaningful.
+// Called by the server when a meal is actually written from this recipe.
+function touchRecipeUsed(recipeId, when) {
+  if (!RECIPE_ID_RE.test(recipeId)) return;
+  const p = path.join(RECIPES_DIR, recipeId, 'recipe.json');
+  const recipe = readJson(p);
+  if (!recipe) return;
+  recipe.times_logged = (recipe.times_logged || 0) + 1;
+  recipe.last_used_at = when || localParts().timestamp;
+  writeJson(p, recipe);
+}
+
+// Turns a saved meal into a recipe (FR-32). Works for a meal saved seconds ago
+// from the review screen and for one pulled out of history months later — both
+// are just a meal.json plus its folder.
+function createRecipeFromMeal(meal, mealDir, name) {
+  const { content, error } = validateAndCleanRecipe({
+    name: name || defaultRecipeName(meal),
+    nutrition: meal.nutrition,
+    items: meal.items,
+    note: meal.note,
+    confidence: meal.confidence,
+    confidence_note: meal.confidence_note,
+    model_used: meal.model_used
+  });
+  if (error) return { error };
+  return {
+    recipe: createRecipe(content, {
+      sourceEntryId: meal.entry_id,
+      srcDir: mealDir,
+      mediaRefs: meal.media_refs
+    })
+  };
+}
+
+// A name to fall back on when the user saves a recipe without typing one:
+// the item names, else the first line of the note, else the meal type.
+function defaultRecipeName(meal) {
+  const names = (meal.items || []).map((i) => i.name).filter(Boolean);
+  if (names.length) return cleanLine(names.slice(0, 3).join(', '), LIMITS.recipeName);
+  const note = (meal.note || '').trim().split('\n')[0].trim();
+  if (note) return cleanLine(note, LIMITS.recipeName);
+  return meal.meal_type ? meal.meal_type[0].toUpperCase() + meal.meal_type.slice(1) : 'Saved meal';
+}
+
+// --- Meal writing ---------------------------------------------------------
+
+// Writes one meal's folder: places its media, writes meal.json, and bumps the
+// stores the meal drew on. Shared by the review-confirm path and the
+// log-a-recipe path so both produce identically shaped records rather than
+// drifting apart. `placeMedia(mealDir)` returns the media filenames it put
+// there; if it throws, the half-built folder is removed and an error returned.
+// Returns { meal, mealDir, savedParts } or { error }.
+function writeMealEntry(content, parts, opts = {}) {
+  // created_at/updated_at are the real save moment, rendered in the user's zone —
+  // for a backfilled entry they deliberately differ from `timestamp`.
+  const savedParts = partsAtOffset(new Date(), parts.offsetMinutes);
+  const entryId = makeEntryId(parts);
+  const mealDir = path.join(MEALS_DIR, entryId);
+  fs.mkdirSync(mealDir, { recursive: true });
+
+  let mediaRefs = [];
+  try {
+    mediaRefs = (opts.placeMedia ? opts.placeMedia(mealDir) : []) || [];
+    // note.txt is written from the confirmed note so the folder is a complete,
+    // consistent record even if the user edited the text in review. (§6.2)
+    if (content.note.trim().length > 0) {
+      fs.writeFileSync(path.join(mealDir, 'note.txt'), content.note);
+      mediaRefs.push('note.txt');
+    }
+  } catch (err) {
+    fs.rmSync(mealDir, { recursive: true, force: true });
+    return { error: `Could not save the meal files: ${err.message}` };
+  }
+
+  const meal = {
+    entry_id: entryId,
+    timestamp: parts.timestamp,
+    date: parts.date,
+    meal_type: content.meal_type,
+    nutrition: content.nutrition,
+    items: content.items,
+    note: content.note,
+    location: content.location,
+    media_refs: mediaRefs,
+    // Provenance when this entry came from the recipe book (FR-33). The name is
+    // snapshotted so the meal reads correctly even if the recipe is later
+    // renamed or deleted — same rule as a pantry item's name on an item. (FR-29)
+    from_recipe_id: opts.fromRecipeId || null,
+    from_recipe_name: opts.fromRecipeName || '',
+    confidence: content.confidence,
+    confidence_note: content.confidence_note,
+    model_used: content.model_used,
+    schema_version: SCHEMA_VERSION,
+    created_at: savedParts.timestamp,
+    updated_at: savedParts.timestamp
+  };
+  writeJson(path.join(mealDir, 'meal.json'), meal);
+
+  // Bump last_used_at on every pantry item this meal referenced, so the
+  // most-recently-used tie-break stays meaningful. (FR-22) The agent never
+  // writes the pantry; the server does, here. (FR-30) It records the save
+  // moment, not the meal's own time: backfilling last Tuesday's shake is still
+  // evidence that the powder is in current rotation.
+  const touchedAt = savedParts.timestamp;
+  for (const item of meal.items) {
+    if (item.origin === 'pantry' && item.pantry_item_id) touchPantryItemUsed(item.pantry_item_id, touchedAt);
+  }
+  if (opts.fromRecipeId) touchRecipeUsed(opts.fromRecipeId, touchedAt);
+
+  return { meal, mealDir, savedParts };
+}
+
 // --- CSV export -----------------------------------------------------------
 
 function csvEscape(value) {
@@ -941,7 +1282,10 @@ function mealToCsvRow(meal) {
 function buildHistoryCsv(meals) {
   const cols = csvColumns();
   const header = cols.join(',') + '\n';
-  const ordered = meals.slice().sort((a, b) => (a.entry_id < b.entry_id ? -1 : 1));
+  // Oldest first. Ordered by `timestamp` for the same reason listings are: an
+  // entry_id is minted once and never re-timed, so it stops tracking a meal that
+  // was later moved to another day. (FR-16d)
+  const ordered = meals.slice().sort((a, b) => byNewestFirst(b, a));
   const body = ordered.map((meal) => {
     const row = mealToCsvRow(meal);
     return cols.map((c) => csvEscape(row[c])).join(',');
@@ -1507,6 +1851,8 @@ app.get('/api/intake/:id', (req, res) => {
     media: { photos: meta.photos || [], audio: meta.audio || null, hasNote: !!meta.hasNote },
     note: meta.note || '',
     occurred_at: meta.occurredAt || null,
+    from_recipe_id: status.from_recipe_id || null,
+    from_recipe_name: status.from_recipe_name || '',
     confidence_threshold: CONFIDENCE_THRESHOLD
   });
 });
@@ -1589,61 +1935,28 @@ app.post('/api/intake/:id/confirm', (req, res) => {
     content.location.name = findNearbyLocationName(content.location.lat, content.location.long, meals);
   }
 
-  // created_at/updated_at are the real save moment, rendered in the user's zone —
-  // for a backfilled entry they deliberately differ from `timestamp`.
-  const savedParts = partsAtOffset(new Date(), parts.offsetMinutes);
-  const entryId = makeEntryId(parts);
-  const mealDir = path.join(MEALS_DIR, entryId);
-  fs.mkdirSync(mealDir, { recursive: true });
+  // A meal staged from a recipe carries that provenance through review, so the
+  // saved entry records where its numbers came from. (FR-33)
+  const stagedStatus = readStagingStatus(stagingId) || {};
 
-  const mediaRefs = [];
-  try {
-    (meta.photos || []).forEach((name) => {
-      if (fs.existsSync(path.join(dir, name))) { moveInto(dir, mealDir, name); mediaRefs.push(name); }
-    });
-    if (meta.audio && fs.existsSync(path.join(dir, meta.audio))) {
-      moveInto(dir, mealDir, meta.audio);
-      mediaRefs.push(meta.audio);
+  const written = writeMealEntry(content, parts, {
+    fromRecipeId: stagedStatus.from_recipe_id || null,
+    fromRecipeName: stagedStatus.from_recipe_name || '',
+    placeMedia: (mealDir) => {
+      const refs = [];
+      (meta.photos || []).forEach((name) => {
+        if (fs.existsSync(path.join(dir, name))) { moveInto(dir, mealDir, name); refs.push(name); }
+      });
+      if (meta.audio && fs.existsSync(path.join(dir, meta.audio))) {
+        moveInto(dir, mealDir, meta.audio);
+        refs.push(meta.audio);
+      }
+      return refs;
     }
-    // note.txt is rewritten from the confirmed note so the folder is a complete,
-    // consistent record even if the user edited the text in review. (§6.2)
-    if (content.note.trim().length > 0) {
-      fs.writeFileSync(path.join(mealDir, 'note.txt'), content.note);
-      mediaRefs.push('note.txt');
-    }
-  } catch (err) {
-    fs.rmSync(mealDir, { recursive: true, force: true });
-    return res.status(500).json({ error: `Could not save the meal files: ${err.message}` });
-  }
-
-  const meal = {
-    entry_id: entryId,
-    timestamp: parts.timestamp,
-    date: parts.date,
-    meal_type: content.meal_type,
-    nutrition: content.nutrition,
-    items: content.items,
-    note: content.note,
-    location: content.location,
-    media_refs: mediaRefs,
-    confidence: content.confidence,
-    confidence_note: content.confidence_note,
-    model_used: content.model_used,
-    schema_version: SCHEMA_VERSION,
-    created_at: savedParts.timestamp,
-    updated_at: savedParts.timestamp
-  };
-  writeJson(path.join(mealDir, 'meal.json'), meal);
-
-  // Bump last_used_at on every pantry item this meal referenced, so the
-  // most-recently-used tie-break stays meaningful. (FR-22) The agent never
-  // writes the pantry; the server does, here. (FR-30) It records the save
-  // moment, not the meal's own time: backfilling last Tuesday's shake is still
-  // evidence that the powder is in current rotation.
-  const touchedAt = savedParts.timestamp;
-  for (const item of meal.items) {
-    if (item.origin === 'pantry' && item.pantry_item_id) touchPantryItemUsed(item.pantry_item_id, touchedAt);
-  }
+  });
+  if (written.error) return res.status(500).json({ error: written.error });
+  const { meal, mealDir } = written;
+  const entryId = meal.entry_id;
 
   // Persist any new pantry items the user accepted in review (FR-8b, FR-23a).
   // Their label photos are copied out of the meal folder so both stores stay
@@ -1655,12 +1968,25 @@ app.post('/api/intake/:id/confirm', (req, res) => {
       addedVia: 'meal-auto',
       addedFromEntryId: entryId,
       srcDir: mealDir,
-      proposals: (readStagingStatus(stagingId) || {}).proposed_pantry_items
+      proposals: stagedStatus.proposed_pantry_items
     });
   } catch (err) { /* meal is saved; a pantry write failure must not lose it */ }
 
+  // "Save to recipe book", ticked in review (FR-32). Like the pantry write, it
+  // is best-effort and runs after the meal is already safely on disk — failing
+  // to remember a recipe must never cost the user the meal itself.
+  let recipeSaved = null;
+  const saveAsRecipe = (req.body || {}).save_as_recipe;
+  if (saveAsRecipe) {
+    try {
+      const name = typeof saveAsRecipe === 'object' ? saveAsRecipe.name : '';
+      const { recipe } = createRecipeFromMeal(meal, mealDir, name);
+      if (recipe) recipeSaved = { recipe_id: recipe.recipe_id, name: recipe.name };
+    } catch (err) { /* meal is saved; the recipe can be added again from history */ }
+  }
+
   removeStaging(stagingId);
-  res.json({ entry_id: entryId, date: meal.date, pantry_added: pantryAdded });
+  res.json({ entry_id: entryId, date: meal.date, pantry_added: pantryAdded, recipe_saved: recipeSaved });
 });
 
 // Cancel/discard an intake: delete its staging dir immediately. (FR-12c)
@@ -1961,6 +2287,178 @@ app.post('/api/pantry/intake/:id/confirm', (req, res) => {
   res.json({ saved });
 });
 
+// --- Recipe routes --------------------------------------------------------
+
+// List the recipe book, most-recently-used first, with an optional `q` search
+// over name / items / note. (FR-31)
+app.get('/api/recipes', (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+  let recipes = listRecipes();
+  if (q) {
+    recipes = recipes.filter((r) => {
+      const hay = [r.name, r.note, ...(r.items || []).map((i) => i.name)].join(' ').toLowerCase();
+      return hay.includes(q);
+    });
+  }
+  res.json({ recipes: recipes.map(summariseRecipe), count: recipes.length });
+});
+
+// A single recipe's full record. (FR-31)
+app.get('/api/recipes/:id', (req, res) => {
+  const id = req.params.id;
+  if (!RECIPE_ID_RE.test(id)) return res.status(400).json({ error: 'Invalid id.' });
+  const recipe = readJson(path.join(RECIPES_DIR, id, 'recipe.json'));
+  if (!recipe) return res.status(404).json({ error: 'Recipe not found.' });
+  res.json(recipe);
+});
+
+// Edit a recipe — name, nutrients, items, note. Rewrites only this recipe's
+// folder; meals already logged from it keep their own saved numbers. (FR-31a)
+app.put('/api/recipes/:id', (req, res) => {
+  const id = req.params.id;
+  if (!RECIPE_ID_RE.test(id)) return res.status(400).json({ error: 'Invalid id.' });
+  const existing = readJson(path.join(RECIPES_DIR, id, 'recipe.json'));
+  if (!existing) return res.status(404).json({ error: 'Recipe not found.' });
+  // The edit form posts only the editable fields, so provenance the form does
+  // not round-trip is carried over rather than blanked.
+  const { content, error } = validateAndCleanRecipe({
+    confidence: existing.confidence,
+    confidence_note: existing.confidence_note,
+    model_used: existing.model_used,
+    ...req.body
+  });
+  if (error) return res.status(400).json({ error });
+  const updated = updateRecipe(id, content);
+  if (!updated) return res.status(404).json({ error: 'Recipe not found.' });
+  res.json(updated);
+});
+
+// Delete a recipe folder. Only the recipe is removed; meals logged from it are
+// untouched and keep their snapshotted name. (FR-31a)
+app.delete('/api/recipes/:id', (req, res) => {
+  const id = req.params.id;
+  if (!RECIPE_ID_RE.test(id)) return res.status(400).json({ error: 'Invalid id.' });
+  const recipeDir = path.join(RECIPES_DIR, id);
+  if (!fs.existsSync(recipeDir)) return res.status(404).json({ error: 'Recipe not found.' });
+  fs.rmSync(recipeDir, { recursive: true, force: true });
+  res.json({ ok: true });
+});
+
+// Serve a recipe's photo, guarded by media_refs.
+app.get('/api/recipes/:id/media/:name', (req, res) => {
+  const id = req.params.id;
+  const name = req.params.name;
+  if (!RECIPE_ID_RE.test(id) || !MEDIA_NAME_RE.test(name)) {
+    return res.status(400).json({ error: 'Invalid request.' });
+  }
+  const recipe = readJson(path.join(RECIPES_DIR, id, 'recipe.json'));
+  if (!recipe || !(recipe.media_refs || []).includes(name)) {
+    return res.status(404).json({ error: 'Not found.' });
+  }
+  res.sendFile(path.join(RECIPES_DIR, id, name));
+});
+
+// Reads and validates a log request's portion + wall clock, shared by the two
+// ways a recipe becomes a meal. Returns { recipe, content, parts } or { error }.
+function prepareRecipeLog(recipeId, body) {
+  const recipe = readJson(path.join(RECIPES_DIR, recipeId, 'recipe.json'));
+  if (!recipe) return { error: 'Recipe not found.', status: 404 };
+
+  const scale = cleanRecipeScale((body || {}).scale);
+  if (scale == null) {
+    return { error: `Portion must be a number between ${MIN_RECIPE_SCALE} and ${MAX_RECIPE_SCALE}.`, status: 400 };
+  }
+
+  const rawOccurredAt = (body || {}).occurred_at;
+  const parts = rawOccurredAt ? parseWallClock(rawOccurredAt) : localParts();
+  if (!parts) return { error: 'That date and time could not be read.', status: 400 };
+
+  // The recipe is a *what*, not a *when*: meal type is classified from the time
+  // it is being eaten, exactly like any other entry (FR-13), and stays
+  // overridable in review.
+  const { content, error } = validateAndCleanMeal({
+    meal_type: classifyMealType(parts.hour),
+    nutrition: recipe.nutrition,
+    items: recipe.items,
+    note: recipe.note,
+    confidence: recipe.confidence,
+    confidence_note: recipe.confidence_note,
+    model_used: recipe.model_used
+  }, parts);
+  if (error) return { error: `This recipe's saved values are no longer valid: ${error}`, status: 400 };
+
+  return { recipe, content: scaleRecipeContent(content, scale), parts, scale };
+}
+
+// Stage a recipe for review (FR-33): build a staging entry that is already
+// `ready`, so the normal review screen opens prefilled and Confirm & Save runs
+// the identical path as an analyzed meal — no agent is spawned and no model call
+// is made, because the numbers are already known.
+app.post('/api/recipes/:id/stage', (req, res) => {
+  const id = req.params.id;
+  if (!RECIPE_ID_RE.test(id)) return res.status(400).json({ error: 'Invalid id.' });
+
+  const prepared = prepareRecipeLog(id, req.body);
+  if (prepared.error) return res.status(prepared.status).json({ error: prepared.error });
+  const { recipe, content, parts } = prepared;
+
+  const stagingId = `${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+  const dir = stagingDir(stagingId);
+  fs.mkdirSync(dir, { recursive: true });
+  writeStagingStatus(stagingId, {
+    status: 'ready',
+    kind: 'meal',
+    result: content,
+    proposed_pantry_items: [],
+    from_recipe_id: recipe.recipe_id,
+    from_recipe_name: recipe.name,
+    createdAt: Date.now()
+  });
+  try {
+    persistUploads(dir, {}, content.note, 'meal', parts.timestamp);
+  } catch (err) {
+    removeStaging(stagingId);
+    return res.status(500).json({ error: `Could not stage the recipe: ${err.message}` });
+  }
+  res.json({ staging_id: stagingId, status: 'ready' });
+});
+
+// Log a recipe straight to the meal store at the given time — the one-tap path
+// from the picker, skipping review entirely. (FR-33b)
+app.post('/api/recipes/:id/log', (req, res) => {
+  const id = req.params.id;
+  if (!RECIPE_ID_RE.test(id)) return res.status(400).json({ error: 'Invalid id.' });
+
+  const prepared = prepareRecipeLog(id, req.body);
+  if (prepared.error) return res.status(prepared.status).json({ error: prepared.error });
+  const { recipe, content, parts } = prepared;
+
+  // One tap means no review step, so there is no geolocation prompt and the
+  // entry saves with no location rather than blocking on one. (FR-14b) Use the
+  // review path instead if the place matters for this entry.
+  const written = writeMealEntry(content, parts, {
+    fromRecipeId: recipe.recipe_id,
+    fromRecipeName: recipe.name
+  });
+  if (written.error) return res.status(500).json({ error: written.error });
+
+  res.json({ entry_id: written.meal.entry_id, date: written.meal.date, name: recipe.name });
+});
+
+// Save an already-saved meal to the recipe book (FR-32) — the path for a meal
+// pulled out of history, days or months after the fact.
+app.post('/api/meals/:id/save-as-recipe', (req, res) => {
+  const id = req.params.id;
+  if (!ENTRY_ID_RE.test(id)) return res.status(400).json({ error: 'Invalid id.' });
+  const mealDir = path.join(MEALS_DIR, id);
+  const meal = readJson(path.join(mealDir, 'meal.json'));
+  if (!meal) return res.status(404).json({ error: 'Meal not found.' });
+
+  const { recipe, error } = createRecipeFromMeal(meal, mealDir, (req.body || {}).name);
+  if (error) return res.status(400).json({ error });
+  res.json({ recipe_id: recipe.recipe_id, name: recipe.name });
+});
+
 if (require.main === module) {
   initAuth();
   sweepStaging();
@@ -2011,10 +2509,18 @@ module.exports = {
   findMatchingPantryItem,
   resolvePantryContribution,
   addNutritionInto,
+  makeRecipeId,
+  validateAndCleanRecipe,
+  cleanRecipeScale,
+  scaleRecipeContent,
+  listRecipes,
+  summariseRecipe,
+  defaultRecipeName,
   NUTRIENTS,
   MEAL_TYPES,
   ITEM_ORIGINS,
   MEALS_DIR,
   PANTRY_DIR,
+  RECIPES_DIR,
   HISTORY_CSV_PATH
 };

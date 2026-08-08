@@ -39,6 +39,11 @@
 
 <template id="tpl-intake">
   <form id="intake-form" class="form">
+    <div class="card recipe-shortcut">
+      <div class="field-label">Eaten this before?</div>
+      <button type="button" class="secondary-btn" id="use-recipe-btn">&#128220; Use a saved recipe</button>
+    </div>
+
     <div class="card">
       <div class="field-label">Photos <span class="muted">— food and/or nutrition labels, add as many as you like</span></div>
       <div id="photo-previews" class="photo-previews"></div>
@@ -115,6 +120,14 @@
 
 <template id="tpl-pantry-item">
   <div id="pantry-item-content"></div>
+</template>
+
+<template id="tpl-recipes">
+  <div id="recipes-content"></div>
+</template>
+
+<template id="tpl-recipe">
+  <div id="recipe-content"></div>
 </template>
 
 <script src="app.js"></script>

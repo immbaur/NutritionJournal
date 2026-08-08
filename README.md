@@ -20,6 +20,11 @@ numbers are **computed from the stored label, not re-estimated** — so the thin
 you buy repeatedly get measured once and reused exactly. See
 [Pantry](#pantry--known-items-store).
 
+And a **recipe book** of whole meals worth eating again. Save a meal once and log
+it later in one tap — at a full portion, a half, or any multiple — with no
+analysis and no model call, because the numbers were settled the first time. See
+[Recipes](#recipes--saved-meals).
+
 No cloud hosting, no database, no build step — Node/Express serving static
 files + a few JSON/multipart endpoints, exposed with a Cloudflare quick tunnel
 so you can use it from your phone. It mirrors the [Momentum](../Momentum) app's
@@ -88,6 +93,10 @@ NUTRITION_PASSWORD=your-password PORT=3100 ./start.sh
 5. Back on the **Today** dashboard, the new meal appears and today's totals
    update — all computed live from the JSON files.
 
+Eaten it before? Skip all of that — **Use a saved recipe** at the top of New
+Intake logs it from the [recipe book](#recipes--saved-meals) with no analysis at
+all.
+
 Any saved meal stays **editable**: tap it on a day's list and hit **Edit** to
 correct nutrient values, items, meal type, place, note, or its date and time.
 Editing rewrites only that one `meal.json`; totals recompute themselves.
@@ -148,6 +157,43 @@ items (search, edit any field including aliases, delete) on the Pantry screen. T
 extraction agent's instructions live in
 [`templates/EXTRACT_ITEM_PROMPT.md`](templates/EXTRACT_ITEM_PROMPT.md).
 
+## Recipes — saved meals
+
+The pantry remembers *ingredients*; the recipe book remembers *whole meals*. If
+you eat the same breakfast most mornings, there is no reason to photograph and
+re-analyze it every time — save it once and log it in a tap. Open it from the
+menu (**Recipes**).
+
+**Three ways a recipe gets in:**
+
+- **Tick the box in review** — "Save to recipe book" on the review screen, with
+  a name pre-filled from the items. The meal is saved either way; the recipe is
+  a copy of it.
+- **From any saved meal** — open a meal from any day (or from months back) and
+  tap **Save as recipe**. Nothing about the meal changes.
+- It stays **editable** afterwards: name, nutrient values, items, note.
+
+**Two ways to use one.** On **New Intake**, "Use a saved recipe" opens the
+picker, most-recently-used first:
+
+- **Tap it** → the normal review screen opens **prefilled**, so you can set the
+  time, place, or tweak a number before saving.
+- **Log now** → written straight to the day at the current time, one tap.
+
+Either way you're asked for a **portion** first (½ / full / 1½ / double, or a
+custom multiplier). Nutrients scale; item amounts are marked with the multiplier
+(`0.5 × 120 g`), since free text like "1 scoop" can't be re-arithmetised and
+shouldn't silently contradict the halved totals.
+
+Logging a recipe **spawns no agent and makes no model call** — the numbers were
+settled when the recipe was saved. Meal type is still classified from the time
+you eat it, not stored on the recipe, so the same recipe is breakfast at 8am and
+a snack at 4pm.
+
+Recipes are **snapshots, not links**: editing or deleting a recipe never
+rewrites meals already logged from it, and each meal keeps the recipe's name so
+its history still reads correctly afterwards.
+
 ## Storage — one folder per meal
 
 Each confirmed meal is its **own folder** under `data/meals/`:
@@ -175,9 +221,17 @@ data/pantry/almond-milk-alpro__7f3a91/
   label-1.jpg      # the nutrition-label photo(s) it was built from
 ```
 
-The two stores are independently self-contained — there is no shared index or
-shared media. A meal may retain a pantry item's id for traceability, but it also
-stores the resolved nutrition values, so changing or deleting that pantry item
+And the **recipe book** under `data/recipes/`, one folder per recipe:
+
+```
+data/recipes/banana-protein-shake__a1b2c3/
+  recipe.json      # the structured recipe — the source of truth
+  photo-1.jpg      # one identifying photo, copied from the meal it came from
+```
+
+The three stores are independently self-contained — there is no shared index or
+shared media. A meal may retain a pantry item's or recipe's id for traceability,
+but it also stores the resolved nutrition values, so changing or deleting either
 cannot alter meal history. The match index the agent sees is built in memory from
 the item folders at analysis time, so there is nothing to keep in sync and nothing
 whose corruption could take out the pantry.
@@ -197,9 +251,11 @@ place and its loss is harmless; regenerate it anytime:
 npm test
 ```
 
-Covers input/schema validation, meal-type classification, location matching,
-on-the-fly aggregation, CSV generation, and the pantry (item validation, id
-slugs, match lookup, and the server-side per-100 arithmetic).
+Covers input/schema validation, meal-type classification, wall-clock parsing and
+timezone rendering, location matching, on-the-fly aggregation, CSV generation,
+the pantry (item validation, id slugs, match lookup, and the server-side per-100
+arithmetic), and recipes (validation, portion scaling and its bounds, name
+fallbacks).
 
 ## Hosting it permanently (DigitalOcean)
 

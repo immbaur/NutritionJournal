@@ -13,7 +13,9 @@ const TITLES = {
   pantry: 'Pantry',
   'pantry-new': 'New Item',
   'pantry-review': 'Review Items',
-  'pantry-item': 'Pantry Item'
+  'pantry-item': 'Pantry Item',
+  recipes: 'Recipes',
+  recipe: 'Recipe'
 };
 
 const PANTRY_VIEWS = ['pantry', 'pantry-new', 'pantry-review', 'pantry-item'];
@@ -39,7 +41,8 @@ let reviewGeo = { lat: null, long: null };
 
 backBtn.addEventListener('click', () => {
   if (currentView === 'meal' || currentView === 'history') navigate('today', viewDate);
-  else if (currentView === 'pantry') navigate('today');
+  else if (currentView === 'pantry' || currentView === 'recipes') navigate('today');
+  else if (currentView === 'recipe') navigate('recipes');
   else if (PANTRY_VIEWS.includes(currentView)) navigate('pantry');
   else navigate('today');
 });
@@ -66,6 +69,8 @@ function navigate(view, arg) {
   if (view === 'pantry-new') wirePantryNew();
   if (view === 'pantry-review') loadPantryReview(arg);
   if (view === 'pantry-item') loadPantryItem(arg);
+  if (view === 'recipes') loadRecipes(arg);
+  if (view === 'recipe') loadRecipe(arg);
 }
 
 // --- API helper -----------------------------------------------------------
@@ -191,9 +196,14 @@ function totalsCardHtml(totals) {
 
 function mealRowHtml(meal) {
   const thumb = firstPhoto(meal);
-  const thumbHtml = thumb
-    ? `<img class="meal-thumb" src="/api/meals/${meal.entry_id}/media/${thumb}" alt="">`
-    : `<div class="meal-thumb placeholder">&#127869;</div>`;
+  // A meal logged from a recipe took no photo of its own, so it borrows the
+  // recipe's for the list. (The meal's media_refs stay its true raw inputs.)
+  let thumbHtml = `<div class="meal-thumb placeholder">&#127869;</div>`;
+  if (thumb) {
+    thumbHtml = `<img class="meal-thumb" src="/api/meals/${meal.entry_id}/media/${thumb}" alt="">`;
+  } else if (meal.from_recipe_id && meal.from_recipe_photo) {
+    thumbHtml = `<img class="meal-thumb" src="/api/recipes/${meal.from_recipe_id}/media/${meal.from_recipe_photo}" alt="">`;
+  }
   const title = mealTitle(meal);
   const kcal = meal.nutrition && meal.nutrition.calories ? Math.round(meal.nutrition.calories.value || 0) : 0;
   return `
@@ -226,6 +236,8 @@ function wireIntake() {
 
   renderPhotoPreviews();
   wireAudio();
+
+  document.getElementById('use-recipe-btn').addEventListener('click', () => navigate('recipes', 'pick'));
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -412,6 +424,7 @@ function renderReviewForm(container, stagingId, data) {
     </div>
 
     ${proposedPantrySectionHtml(data.proposed_pantry_items)}
+    ${recipeSectionHtml(data, result)}
 
     <div class="card">
       <p class="section-title">When</p>
@@ -427,6 +440,7 @@ function renderReviewForm(container, stagingId, data) {
       </label>
     </div>
 
+    ${data.from_recipe_id ? '' : `
     <details class="card">
       <summary style="cursor:pointer;color:var(--text-dim);">Add more detail &amp; re-analyze</summary>
       <div style="margin-top:0.75rem;">
@@ -435,7 +449,7 @@ function renderReviewForm(container, stagingId, data) {
         <textarea id="rerun-text" rows="2" placeholder="Add detail, e.g. it was 200g, cooked in 1 tbsp olive oil" style="margin-top:0.6rem;"></textarea>
         <button type="button" class="secondary-btn" id="rerun-btn" style="margin-top:0.6rem;">Re-analyze</button>
       </div>
-    </details>
+    </details>`}
 
     <div class="action-row">
       <button class="danger-btn" id="cancel-review">Cancel</button>
@@ -446,11 +460,45 @@ function renderReviewForm(container, stagingId, data) {
   wireNutrientEditor(container);
   wireItemsEditor(container.querySelector('#items-editor'), container.querySelector('#add-item'));
   wireProposedPantry(container);
+  wireRecipeSection();
   wireWhenField();
   wireRerun(stagingId);
 
   document.getElementById('cancel-review').addEventListener('click', () => cancelIntake(stagingId));
   document.getElementById('confirm-review').addEventListener('click', () => confirmReview(stagingId, data.occurred_at));
+}
+
+// "Save to recipe book" (FR-32). Hidden when this entry *came* from a recipe —
+// re-saving what you just logged from would only duplicate it; the banner says
+// where the numbers came from instead.
+function recipeSectionHtml(data, result) {
+  if (data.from_recipe_id) {
+    return `
+      <div class="card recipe-from">
+        &#128220; From your recipe <strong>${escapeHtml(data.from_recipe_name)}</strong>.
+        Adjust anything below — it changes this entry only, not the recipe.
+      </div>`;
+  }
+  const suggested = defaultRecipeName({ items: result.items, note: data.note || result.note, meal_type: result.meal_type });
+  return `
+    <div class="card">
+      <label class="pantry-card-toggle">
+        <input type="checkbox" id="save-recipe">
+        <span>Save to recipe book &mdash; log it again in one tap next time</span>
+      </label>
+      <label class="field-label" id="save-recipe-name-wrap" style="margin-top:0.6rem;display:none;">Recipe name
+        <input type="text" id="save-recipe-name" value="${escapeAttr(suggested)}">
+      </label>
+    </div>`;
+}
+
+function wireRecipeSection() {
+  const cb = document.getElementById('save-recipe');
+  const wrap = document.getElementById('save-recipe-name-wrap');
+  if (!cb || !wrap) return;
+  const sync = () => { wrap.style.display = cb.checked ? '' : 'none'; };
+  cb.addEventListener('change', sync);
+  sync();
 }
 
 // The "remember this product" cards (FR-8b): any new pantry item the agent
@@ -508,6 +556,9 @@ function wireRerun(stagingId) {
   const extraPhotos = [];
   const input = document.getElementById('rerun-photos');
   const previews = document.getElementById('rerun-previews');
+  // Absent for an entry staged from a recipe: re-analyzing would throw away
+  // numbers that are already exact and replace them with a fresh estimate.
+  if (!input || !previews) return;
   function render() {
     previews.innerHTML = extraPhotos.map((f, i) => `<div class="photo-preview"><img src="${URL.createObjectURL(f)}" alt=""><button type="button" data-x="${i}">&times;</button></div>`).join('');
     previews.querySelectorAll('[data-x]').forEach((b) => b.addEventListener('click', () => { extraPhotos.splice(Number(b.dataset.x), 1); render(); }));
@@ -544,7 +595,8 @@ async function confirmReview(stagingId, stagedOccurredAt) {
     confidence: currentConfidence,
     confidence_note: currentConfidenceNote,
     model_used: currentModelUsed,
-    pantry_items: readAcceptedPantryItems()
+    pantry_items: readAcceptedPantryItems(),
+    save_as_recipe: readSaveAsRecipe()
   };
   try {
     const res = await api(`/api/intake/${stagingId}/confirm`, {
@@ -556,11 +608,19 @@ async function confirmReview(stagingId, stagedOccurredAt) {
       const names = res.pantry_added.map((p) => p.brand ? `${p.name} (${p.brand})` : p.name);
       await showMessage(`${res.pantry_added.some((p) => p.updated) ? 'Updated' : 'Added'} in your pantry: ${names.join(', ')}.`);
     }
+    if (res.recipe_saved) await showMessage(`Saved “${res.recipe_saved.name}” to your recipe book.`);
     navigate('today', res.date);
   } catch (err) {
     btn.disabled = false;
     if (err.status !== 401) await showMessage(`Could not save: ${err.message}`);
   }
+}
+
+function readSaveAsRecipe() {
+  const cb = document.getElementById('save-recipe');
+  if (!cb || !cb.checked) return null;
+  const nameEl = document.getElementById('save-recipe-name');
+  return { name: nameEl ? nameEl.value.trim() : '' };
 }
 
 async function cancelIntake(stagingId) {
@@ -773,7 +833,7 @@ function renderMealDetail(container, meal) {
         <h2 style="margin:0;font-size:1.2rem;">${escapeHtml(mealTitle(meal))}</h2>
         <span class="pill">${escapeHtml(meal.meal_type)}</span>
       </div>
-      <p class="muted" style="margin:0;">${escapeHtml(formatDateTime(meal.timestamp))}${meal.location && meal.location.name ? ' · ' + escapeHtml(meal.location.name) : ''}</p>
+      <p class="muted" style="margin:0;">${escapeHtml(formatDateTime(meal.timestamp))}${meal.location && meal.location.name ? ' · ' + escapeHtml(meal.location.name) : ''}${meal.from_recipe_name ? ' · &#128220; from recipe' : ''}</p>
     </div>
 
     <div class="card">
@@ -790,12 +850,16 @@ function renderMealDetail(container, meal) {
 
     <div class="card muted" style="font-size:0.75rem;">Model: ${escapeHtml(meal.model_used || 'n/a')} · ${meal.location && meal.location.lat != null ? `${meal.location.lat.toFixed(4)}, ${meal.location.long.toFixed(4)}` : 'no location'}</div>
 
+    <div class="action-row single">
+      <button class="secondary-btn" id="save-as-recipe">&#128220; Save as recipe</button>
+    </div>
     <div class="action-row">
       <button class="danger-btn" id="delete-meal">Delete</button>
       <button class="secondary-btn" id="edit-meal">Edit</button>
     </div>
   `;
 
+  document.getElementById('save-as-recipe').addEventListener('click', () => saveMealAsRecipe(meal));
   document.getElementById('edit-meal').addEventListener('click', () => renderMealEdit(container, meal));
   document.getElementById('delete-meal').addEventListener('click', async () => {
     if (!(await showConfirm('Delete this meal? This cannot be undone.'))) return;
@@ -1275,6 +1339,307 @@ async function cancelPantryIntake(stagingId) {
   navigate('pantry');
 }
 
+// --- Recipes (saved meals) ------------------------------------------------
+// A recipe is a whole meal worth eating again. Logging one needs no agent and
+// no model call — the numbers were settled the first time round.
+
+// `mode` is 'browse' (the Recipes screen) or 'pick' (chosen from New Intake).
+async function loadRecipes(mode) {
+  const container = document.getElementById('recipes-content');
+  container.innerHTML = '<p class="empty-state">Loading…</p>';
+  let data;
+  try {
+    data = await api('/api/recipes');
+  } catch (err) {
+    if (err.status === 401) return;
+    container.innerHTML = `<p class="empty-state">Could not load your recipes: ${escapeHtml(err.message)}</p>`;
+    return;
+  }
+  renderRecipeList(container, data.recipes, '', mode === 'pick' ? 'pick' : 'browse');
+}
+
+function renderRecipeList(container, recipes, query, mode) {
+  const listHtml = recipes.length
+    ? `<div class="card" style="padding:0.25rem 1.25rem;">${recipes.map((r) => recipeRowHtml(r, mode)).join('')}</div>`
+    : (query
+        ? `<p class="empty-state">No recipes match “${escapeHtml(query)}”.</p>`
+        : `<p class="empty-state">Your recipe book is empty.<br>Tick <strong>Save to recipe book</strong> when you log a meal, or open any saved meal and tap <strong>Save as recipe</strong>.</p>`);
+
+  container.innerHTML = `
+    ${mode === 'pick' ? '<p class="muted" style="margin:0 0 0.8rem;">Tap a recipe to review and adjust it, or <strong>Log now</strong> to save it straight away at the current time.</p>' : ''}
+    <input type="search" id="recipe-search" class="pantry-search" placeholder="Search name, item, note…" value="${escapeAttr(query)}">
+    ${listHtml}
+  `;
+
+  container.querySelectorAll('[data-recipe-id]').forEach((row) => {
+    const id = row.dataset.recipeId;
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('[data-log-now]')) return;
+      if (mode === 'pick') stageRecipe(id);
+      else navigate('recipe', id);
+    });
+    const logBtn = row.querySelector('[data-log-now]');
+    if (logBtn) logBtn.addEventListener('click', () => logRecipeNow(id, row.dataset.recipeName));
+  });
+
+  const search = document.getElementById('recipe-search');
+  let timer = null;
+  search.addEventListener('input', () => {
+    clearTimeout(timer);
+    const q = search.value.trim();
+    timer = setTimeout(async () => {
+      try {
+        const data = await api(`/api/recipes?q=${encodeURIComponent(q)}`);
+        if (currentView !== 'recipes') return;
+        renderRecipeList(container, data.recipes, q, mode);
+        document.getElementById('recipe-search').focus();
+      } catch (err) { /* keep the current list on a transient failure */ }
+    }, 200);
+  });
+}
+
+function recipeRowHtml(recipe, mode) {
+  const photo = (recipe.media_refs || [])[0];
+  const thumbHtml = photo
+    ? `<img class="meal-thumb" src="/api/recipes/${recipe.recipe_id}/media/${photo}" alt="">`
+    : `<div class="meal-thumb placeholder">&#128220;</div>`;
+  const kcal = recipe.nutrition && recipe.nutrition.calories
+    ? Math.round(recipe.nutrition.calories.value || 0) : 0;
+  const used = recipe.times_logged
+    ? `logged ${recipe.times_logged}×`
+    : 'not logged yet';
+  const protein = recipe.nutrition && recipe.nutrition.protein_g
+    ? `P ${formatNum(recipe.nutrition.protein_g.value)}` : '';
+  return `
+    <div class="meal-row" data-recipe-id="${escapeAttr(recipe.recipe_id)}" data-recipe-name="${escapeAttr(recipe.name)}">
+      ${thumbHtml}
+      <div class="meal-row-main">
+        <div class="meal-title">${escapeHtml(recipe.name)}</div>
+        <div class="meal-sub">${escapeHtml([protein, used].filter(Boolean).join(' · '))}</div>
+      </div>
+      ${mode === 'pick'
+        ? `<button type="button" class="log-now-btn" data-log-now>Log now</button>`
+        : `<div class="meal-row-kcal"><span class="value">${kcal}</span><br><span class="unit">kcal</span></div>`}
+    </div>`;
+}
+
+// Portion is asked for once, up front, and applied server-side — so the review
+// screen and the one-tap path can never disagree about what was scaled.
+async function askPortion(recipeName) {
+  const choice = await showPortionPrompt(recipeName);
+  return choice;
+}
+
+function showPortionPrompt(recipeName) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'confirm-overlay';
+    overlay.innerHTML = `
+      <div class="confirm-box">
+        <p>How much of <strong>${escapeHtml(recipeName || 'this recipe')}</strong>?</p>
+        <div class="portion-row">
+          ${[['0.5', '½'], ['1', 'Full'], ['1.5', '1½'], ['2', 'Double']]
+            .map(([v, label]) => `<button class="portion-btn${v === '1' ? ' selected' : ''}" data-portion="${v}">${label}</button>`).join('')}
+        </div>
+        <label class="field-label" style="margin-top:0.8rem;">Or a custom multiplier
+          <input type="number" inputmode="decimal" step="any" min="0.05" max="20" id="portion-custom" placeholder="e.g. 0.75">
+        </label>
+        <div class="action-row">
+          <button class="secondary-btn" data-choice="cancel">Cancel</button>
+          <button class="primary-btn" data-choice="ok">Continue</button>
+        </div>
+      </div>`;
+    let scale = 1;
+    const custom = overlay.querySelector('#portion-custom');
+    overlay.querySelectorAll('[data-portion]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        scale = Number(btn.dataset.portion);
+        custom.value = '';
+        overlay.querySelectorAll('[data-portion]').forEach((b) => b.classList.toggle('selected', b === btn));
+      });
+    });
+    custom.addEventListener('input', () => {
+      overlay.querySelectorAll('[data-portion]').forEach((b) => b.classList.remove('selected'));
+    });
+    overlay.addEventListener('click', (e) => {
+      const choice = e.target.dataset.choice;
+      if (!choice) return;
+      overlay.remove();
+      if (choice !== 'ok') return resolve(null);
+      const typed = custom.value.trim();
+      resolve(typed === '' ? scale : Number(typed));
+    });
+    document.body.appendChild(overlay);
+  });
+}
+
+// Tap a recipe: stage it as an already-ready intake, so the normal review screen
+// opens prefilled and the time, place and numbers all stay adjustable.
+async function stageRecipe(recipeId, name) {
+  const scale = await askPortion(name);
+  if (scale == null) return;
+  try {
+    const res = await api(`/api/recipes/${recipeId}/stage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scale, occurred_at: wallClockNow() })
+    });
+    navigate('review', res.staging_id);
+  } catch (err) {
+    if (err.status !== 401) await showMessage(`Could not open that recipe: ${err.message}`);
+  }
+}
+
+// "Log now": straight to the meal store at the current time, no review.
+async function logRecipeNow(recipeId, name) {
+  const scale = await askPortion(name);
+  if (scale == null) return;
+  try {
+    const res = await api(`/api/recipes/${recipeId}/log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scale, occurred_at: wallClockNow() })
+    });
+    navigate('today', res.date);
+  } catch (err) {
+    if (err.status !== 401) await showMessage(`Could not log that recipe: ${err.message}`);
+  }
+}
+
+async function loadRecipe(recipeId) {
+  const container = document.getElementById('recipe-content');
+  container.innerHTML = '<p class="empty-state">Loading…</p>';
+  let recipe;
+  try {
+    recipe = await api(`/api/recipes/${recipeId}`);
+  } catch (err) {
+    if (err.status === 401) return;
+    container.innerHTML = `<p class="empty-state">${escapeHtml(err.message)}</p>`;
+    return;
+  }
+  renderRecipeDetail(container, recipe);
+}
+
+function renderRecipeDetail(container, recipe) {
+  const photo = (recipe.media_refs || [])[0];
+  const photosHtml = photo
+    ? `<div class="detail-photos"><img src="/api/recipes/${recipe.recipe_id}/media/${photo}" alt=""></div>`
+    : '';
+  const used = recipe.times_logged
+    ? `Logged ${recipe.times_logged}×${recipe.last_used_at ? ` · last ${escapeHtml(formatDateTime(recipe.last_used_at))}` : ''}`
+    : 'Not logged yet';
+
+  container.innerHTML = `
+    ${photosHtml}
+    <div class="card">
+      <h2 style="margin:0;font-size:1.2rem;">${escapeHtml(recipe.name)}</h2>
+      <p class="muted" style="margin:0.4rem 0 0;">${used}</p>
+    </div>
+
+    <div class="card">
+      <p class="section-title">Nutrition <span class="muted">per portion</span></p>
+      ${NUTRIENTS.map((n) => nutrientDetailRow(n, recipe.nutrition[n.key])).join('')}
+    </div>
+
+    ${(recipe.items && recipe.items.length) ? `<div class="card"><p class="section-title">Items</p>${recipe.items.map(itemDetailHtml).join('')}</div>` : ''}
+    ${recipe.note ? `<div class="card"><p class="section-title">Note</p><p style="margin:0;line-height:1.5;">${escapeHtml(recipe.note)}</p></div>` : ''}
+
+    <div class="action-row single">
+      <button class="primary-btn" id="log-recipe">Log this recipe</button>
+    </div>
+    <div class="action-row">
+      <button class="danger-btn" id="delete-recipe">Delete</button>
+      <button class="secondary-btn" id="edit-recipe">Edit</button>
+    </div>
+  `;
+
+  document.getElementById('log-recipe').addEventListener('click', () => stageRecipe(recipe.recipe_id, recipe.name));
+  document.getElementById('edit-recipe').addEventListener('click', () => renderRecipeEdit(container, recipe));
+  document.getElementById('delete-recipe').addEventListener('click', async () => {
+    if (!(await showConfirm('Delete this recipe? Meals you already logged from it keep their own numbers.'))) return;
+    try {
+      await api(`/api/recipes/${recipe.recipe_id}`, { method: 'DELETE' });
+      navigate('recipes');
+    } catch (err) {
+      if (err.status !== 401) await showMessage(`Could not delete: ${err.message}`);
+    }
+  });
+}
+
+function renderRecipeEdit(container, recipe) {
+  container.innerHTML = `
+    <div class="card">
+      <label class="field-label">Name<input type="text" id="recipe-name" value="${escapeAttr(recipe.name)}"></label>
+    </div>
+    <div class="card">
+      <p class="section-title">Nutrition <span class="muted">per portion</span></p>
+      ${nutrientEditorHtml(recipe.nutrition)}
+    </div>
+    <div class="card">
+      <p class="section-title">Items</p>
+      <div id="items-editor">${itemsEditorHtml(recipe.items)}</div>
+      <button type="button" class="add-row-btn" id="add-item">+ Add item</button>
+    </div>
+    <div class="card">
+      <label class="field-label">Note<textarea id="recipe-note" rows="2">${escapeHtml(recipe.note || '')}</textarea></label>
+    </div>
+    <div class="action-row">
+      <button class="secondary-btn" id="cancel-recipe-edit">Cancel</button>
+      <button class="primary-btn" id="save-recipe-edit">Save</button>
+    </div>
+  `;
+  wireItemsEditor(container.querySelector('#items-editor'), container.querySelector('#add-item'));
+  document.getElementById('cancel-recipe-edit').addEventListener('click', () => renderRecipeDetail(container, recipe));
+  document.getElementById('save-recipe-edit').addEventListener('click', async () => {
+    const btn = document.getElementById('save-recipe-edit');
+    const name = document.getElementById('recipe-name').value.trim();
+    if (!name) { await showMessage('A recipe needs a name.'); return; }
+    btn.disabled = true;
+    try {
+      const updated = await api(`/api/recipes/${recipe.recipe_id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name,
+          nutrition: readNutritionFromDom(),
+          items: readItemsFromDom(),
+          note: document.getElementById('recipe-note').value
+        })
+      });
+      renderRecipeDetail(container, updated);
+    } catch (err) {
+      btn.disabled = false;
+      if (err.status !== 401) await showMessage(`Could not save: ${err.message}`);
+    }
+  });
+}
+
+// Save an already-saved meal into the recipe book, from its detail screen.
+async function saveMealAsRecipe(meal) {
+  const name = await showPrompt('Save to recipe book as:', defaultRecipeName(meal));
+  if (name == null) return;
+  try {
+    const res = await api(`/api/meals/${meal.entry_id}/save-as-recipe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name })
+    });
+    await showMessage(`Saved “${res.name}” to your recipe book.`);
+  } catch (err) {
+    if (err.status !== 401) await showMessage(`Could not save the recipe: ${err.message}`);
+  }
+}
+
+// Mirrors the server's fallback (FR-32) so the prompt opens with the same name
+// the server would have picked anyway.
+function defaultRecipeName(meal) {
+  const names = (meal.items || []).map((i) => i.name).filter(Boolean);
+  if (names.length) return names.slice(0, 3).join(', ');
+  const note = (meal.note || '').trim().split('\n')[0].trim();
+  if (note) return note;
+  return meal.meal_type ? meal.meal_type[0].toUpperCase() + meal.meal_type.slice(1) : 'Saved meal';
+}
+
 // --- Menu -----------------------------------------------------------------
 
 function showMenu() {
@@ -1285,6 +1650,7 @@ function showMenu() {
   sheet.innerHTML = `
     <button data-act="today">Today</button>
     <button data-act="history">History</button>
+    <button data-act="recipes">Recipes</button>
     <button data-act="pantry">Pantry</button>
     <button data-act="export">Export CSV</button>
     <button data-act="logout">Log out</button>`;
@@ -1302,6 +1668,7 @@ function showMenu() {
     document.removeEventListener('click', close);
     if (act === 'today') navigate('today');
     if (act === 'history') navigate('history');
+    if (act === 'recipes') navigate('recipes');
     if (act === 'pantry') navigate('pantry');
     if (act === 'export') window.location.href = '/api/export/csv';
     if (act === 'logout') {
@@ -1332,6 +1699,33 @@ function showConfirm(message) {
       resolve(choice === 'ok');
     });
     document.body.appendChild(overlay);
+  });
+}
+
+// Resolves to the typed string, or null if cancelled (so an empty string stays
+// distinguishable from "never mind").
+function showPrompt(message, initial) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'confirm-overlay';
+    overlay.innerHTML = `
+      <div class="confirm-box">
+        <p>${escapeHtml(message)}</p>
+        <input type="text" id="prompt-input" value="${escapeAttr(initial || '')}">
+        <div class="action-row">
+          <button class="secondary-btn" data-choice="cancel">Cancel</button>
+          <button class="primary-btn" data-choice="ok">Save</button>
+        </div>
+      </div>`;
+    const input = overlay.querySelector('#prompt-input');
+    const done = (ok) => { overlay.remove(); resolve(ok ? input.value.trim() : null); };
+    overlay.addEventListener('click', (e) => {
+      const choice = e.target.dataset.choice;
+      if (choice) done(choice === 'ok');
+    });
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') done(true); });
+    document.body.appendChild(overlay);
+    setTimeout(() => { input.focus(); input.select(); }, 0);
   });
 }
 
@@ -1484,8 +1878,10 @@ function firstPhoto(meal) {
   return (meal.media_refs || []).find((r) => /\.(jpg|jpeg|png|webp|gif|heic|heif)$/i.test(r)) || null;
 }
 
-// A short label for a meal: first item name(s), else the note, else meal type.
+// A short label for a meal: the recipe it came from if any, else the first item
+// name(s), else the note, else meal type.
 function mealTitle(meal) {
+  if (meal.from_recipe_name) return meal.from_recipe_name;
   if (meal.items && meal.items.length) {
     const names = meal.items.map((i) => i.name).filter(Boolean);
     if (names.length) return names.slice(0, 3).join(', ') + (names.length > 3 ? '…' : '');
